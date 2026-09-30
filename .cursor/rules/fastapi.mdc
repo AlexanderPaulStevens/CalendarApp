@@ -1,0 +1,14 @@
+---
+description: "FastAPI endpoint patterns: when to use def vs async def for blocking and non-blocking I/O."
+globs: app/routers/**
+alwaysApply: false
+---
+# FastAPI Endpoint Patterns
+
+## `def` vs `async def`
+
+- Use plain `def` when the endpoint calls synchronous/blocking code (file reads, DB operations via SQLModel, no `await`)
+- FastAPI automatically runs `def` endpoints in a threadpool — this is the correct approach for blocking I/O
+- `async def` with blocking code **blocks the event loop** and freezes all concurrent requests
+- Only use `async def` when all I/O inside uses `await` (e.g., `httpx.AsyncClient`, async DB drivers)
+- Reference: [FastAPI async docs](https://fastapi.tiangolo.com/async/#path-operation-functions)

@@ -1,0 +1,71 @@
+---
+description: When the user wants to refactor or when they mention to fix or check their code.
+globs:
+alwaysApply: false
+---
+# Refactoring Guidelines
+
+## When to Refactor
+
+- Large functions (> 50 lines)
+- Large files (> 400 lines)
+- Code duplication
+- Complex or hard-to-read logic
+- Poor naming
+- Performance bottlenecks (CPU, memory, I/O)
+- Tight coupling between modules / layers
+- Inconsistent error handling or state management
+
+## Refactoring Workflow
+
+1. Ensure tests cover current behaviour
+2. Plan small, incremental steps
+3. Keep behaviour stable – run tests after every change
+4. Update type hints, docs and comments alongside code changes
+5. Submit changes for code review
+6. Verify performance and monitor in production
+
+## Common Patterns
+
+- Extract function / method
+- Simplify conditionals
+- Consolidate duplicate code (DRY)
+- Introduce data classes or DTOs for related fields
+- Encapsulate external calls behind clean interfaces
+- Standardise error handling with helper utilities
+
+### Example
+
+```python
+# Before
+
+def process_order(data):
+    # long function handling validation, transformation,
+    # persistence and notification
+    ...
+
+# After
+
+def process_order(data):
+    validated = _validate(data)
+    transformed = _transform(validated)
+    _persist(transformed)
+    _notify()
+```
+
+## Tooling
+
+- Static type checking: mypy
+- Linting & formatting: ruff / flake8 / black
+- Complexity analysis: radon (or similar)
+- Dependency analysis: pipdeptree
+- Test coverage: pytest + coverage
+
+## Checklist
+
+- [ ] Tests in place and passing
+- [ ] Behaviour unchanged
+- [ ] Readability improved
+- [ ] No code duplication
+- [ ] Docs & type hints updated
+- [ ] Performance acceptable

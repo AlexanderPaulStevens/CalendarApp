@@ -1,0 +1,90 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# Tesseract Cursor Rule Maintenance
+
+## Purpose
+Automatically analyze and suggest cursor rule improvements when patterns indicate updates would be valuable for the Tesseract data transformation pipeline project.
+
+## Auto-Update Triggers
+
+### Suggest Updates When:
+- **Repeated Agent Patterns**: Same agent development advice given 2+ times that isn't in existing rules
+- **Emerging Transformation Patterns**: New data transformation patterns that should be codified
+- **Azure Integration Patterns**: New Azure service integration patterns or best practices
+- **Performance Optimization**: Repeated performance advice for LLM calls or data processing
+- **Testing Patterns**: New testing strategies for agents or data transformations
+- **Gap Coverage**: Common Tesseract scenarios without guidance
+- **Google Style Guide Compliance**: New patterns that need Google Style Guide alignment
+
+### Don't Update For:
+- One-off corrections or edge cases
+- Project-specific context that won't apply broadly
+- Minor stylistic preferences without clear benefit
+- Temporary workarounds or experimental patterns
+
+## Update Workflow
+
+1. **Identify Gap**: What specific Tesseract guidance is missing/outdated?
+2. **Assess Impact**: How frequently does this issue occur in agent development or data transformation?
+3. **Propose Solution**: Provide ready-to-use rule content with rationale
+4. **Reference Evidence**: Show examples where update would help
+
+## Update Types
+
+### Content Enhancement
+- Add examples for agent development patterns
+- Clarify Azure integration language
+- Include checklists for data transformation validation
+- Add performance optimization guidelines
+- Ensure Google Style Guide compliance
+
+### Structural Updates
+- Split large agent development rules
+- Merge overlapping Azure integration patterns
+- Reorganize data transformation guidelines
+- Update project structure references
+- Align with Google Style Guide organization
+
+### Technical Updates
+- Update code examples for new agent patterns
+- Add new Azure service integration patterns
+- Remove deprecated transformation approaches
+- Update configuration management patterns
+- Ensure type annotation compliance with Google standards
+
+## Quality Metrics
+
+Track and improve based on:
+- Frequency of manual corrections for agent development
+- New patterns in data transformation codebase
+- Error prevention effectiveness in Azure integration
+- Code quality improvements in agent implementations
+- Google Style Guide compliance adherence
+
+## Tesseract-Specific Considerations
+
+### Agent Development Focus
+- Monitor for new agent patterns and best practices
+- Track common agent development issues
+- Identify knowledge retrieval optimization patterns
+- Document LLM integration improvements
+- Ensure Google Style Guide compliance in agent code
+
+### Data Transformation Patterns
+- Monitor for new transformation logic patterns
+- Track DataFrame handling optimizations
+- Identify evaluation and validation improvements
+- Document reference table integration patterns
+- Maintain Google Style Guide standards in transformation code
+
+### Azure Integration Evolution
+- Monitor for new Azure service patterns
+- Track security and authentication improvements
+- Identify performance optimization strategies
+- Document infrastructure as code patterns
+- Ensure Google Style Guide compliance in integration code
+
+**Goal**: Self-improving rules that evolve with the Tesseract codebase and development practices, specifically focused on AI agent development and data transformation pipeline patterns while maintaining Google Python Style Guide compliance.
