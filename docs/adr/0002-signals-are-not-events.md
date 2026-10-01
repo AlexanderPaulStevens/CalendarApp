@@ -1,0 +1,3 @@
+# Signals are derived prep markers, not Events
+
+Prep for upcoming Events (gym bag, charge devices, overnight oats, leave for the store) must be visible on the calendar and may sit on top of other blocks. Modeling that as Events would break the non-overlap planner invariant. We decided Signals are a separate derived kind: instants at Event start minus lead time, emitted by the backend into each plan snapshot from a closed Signal template catalog (match on type/activity and optional recipe id or tag). Users do not author Signals; they move and vanish with their owning Event. Delivery is calendar markers plus client notifications (OS notification when permitted, in-app fallback); server Web Push on GCP can come later without changing the Signal model.

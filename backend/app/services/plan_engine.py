@@ -3,42 +3,62 @@
 from __future__ import annotations
 
 import math
+import random
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.config import settings as app_config
+from app.ingredients.shelf_life import ensure_fridge_shelf_lives
+from app.rules.access import rule_enabled, rule_params
+from app.rules.catalog import study_blocks_from_params, work_blocks_from_params
 from app.schemas.models import (
     Activity,
-    AppSettings,
     AppState,
-    CalendarView,
     Event,
     EventType,
     Origin,
     PlanSnapshot,
+    RuleKey,
     ShoppingLine,
-    Suggestion,
-    SuggestionKind,
     Unit,
     WeekSummary,
     new_id,
 )
+from app.signals import emit as signal_emit
+
+ROUTINE_WORK_TITLE = "Work"
+ROUTINE_STUDY_TITLE = "Study"
+# How many extra weeks after the viewed week to plan (preload).
+PLAN_PRELOAD_WEEKS = 1
 
 
-def _tz(state: AppState) -> ZoneInfo | timezone:
+def _tz(_state: AppState | None = None) -> ZoneInfo | timezone:
     try:
-        return ZoneInfo(state.settings.timezone)
+        return ZoneInfo(app_config.default_timezone)
     except Exception:
-        try:
-            return ZoneInfo("Etc/UTC")
-        except Exception:
-            return timezone.utc
+        return timezone.utc
 
 
 def _as_local(dt: datetime, tz: ZoneInfo | timezone) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(tz)
+
+
+def _f(params: dict[str, Any], key: str, default: float = 0.0) -> float:
+    val = params.get(key, default)
+    if val is None:
+        return default
+    return float(val)
+
+
+def _i(params: dict[str, Any], key: str, default: int = 0) -> int:
+    val = params.get(key, default)
+    if val is None:
+        return default
+    return int(val)
 
 
 def week_bounds(
@@ -53,63 +73,96 @@ def week_bounds(
     return start, end
 
 
-def view_bounds(
-    view: CalendarView, anchor: date, tz: ZoneInfo | timezone
+def planning_horizon(
+    now: datetime,
+    tz: ZoneInfo | timezone,
+    weeks: int | None = None,
+    through: date | None = None,
+    *,
+    preload_weeks: int = PLAN_PRELOAD_WEEKS,
 ) -> tuple[datetime, datetime]:
-    """Return the inclusive-exclusive event window for a calendar view.
+    """Range to (re)plan: week containing ``through`` (or today) + preload.
 
-    Day is midnight→next midnight on ``anchor``. Week is Monday→Monday for
-    the week containing ``anchor``. Month is the 6-week grid starting on
-    the Monday of the week that contains the first of ``anchor``'s month.
-    Bounds use the app timezone.
+    Past weeks before the current Monday are not replanned. Auto events
+    outside this window are left as persisted.
     """
-    if view == CalendarView.DAY:
-        start = datetime(anchor.year, anchor.month, anchor.day, tzinfo=tz)
-        return start, start + timedelta(days=1)
-    if view == CalendarView.WEEK:
-        monday = anchor - timedelta(days=anchor.weekday())
-        start = datetime(monday.year, monday.month, monday.day, tzinfo=tz)
-        return start, start + timedelta(days=7)
-    first = date(anchor.year, anchor.month, 1)
-    grid_start = first - timedelta(days=first.weekday())
-    start = datetime(
-        grid_start.year, grid_start.month, grid_start.day, tzinfo=tz
+    current_monday, _ = week_bounds(now, tz)
+    if through is None:
+        through = _as_local(now, tz).date()
+    monday = through - timedelta(days=through.weekday())
+    start = datetime(monday.year, monday.month, monday.day, tzinfo=tz)
+    if start < current_monday:
+        start = current_monday
+    # ``weeks`` kept for callers; default is viewed week only (+ preload).
+    span = max(1, weeks if weeks is not None else 1)
+    end = start + timedelta(days=7 * (span + max(0, preload_weeks)))
+    return start, end
+
+
+def iter_planning_weeks(
+    now: datetime,
+    tz: ZoneInfo | timezone,
+    weeks: int | None = None,
+    through: date | None = None,
+    *,
+    preload_weeks: int = PLAN_PRELOAD_WEEKS,
+) -> list[tuple[datetime, datetime]]:
+    start, end = planning_horizon(
+        now, tz, weeks, through, preload_weeks=preload_weeks
     )
-    return start, start + timedelta(days=42)
+    out: list[tuple[datetime, datetime]] = []
+    cur = start
+    while cur < end:
+        out.append((cur, cur + timedelta(days=7)))
+        cur += timedelta(days=7)
+    return out
 
 
-def event_window_for_view(
+def event_window_for_week(
     state: AppState,
-    view: CalendarView,
     anchor: date | None,
     now: datetime,
 ) -> tuple[datetime, datetime]:
-    """Resolve view/anchor to an event filter window in the app timezone."""
+    """Monday–Sunday window containing anchor (or today when unset)."""
     tz = _tz(state)
     if anchor is None:
         anchor = _as_local(now, tz).date()
-    return view_bounds(view, anchor, tz)
+    monday = anchor - timedelta(days=anchor.weekday())
+    start = datetime(monday.year, monday.month, monday.day, tzinfo=tz)
+    return start, start + timedelta(days=7)
 
 
 def hours_between(start: datetime, end: datetime) -> float:
     return max(0.0, (end - start).total_seconds() / 3600.0)
 
 
-def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+def overlaps(
+    a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime
+) -> bool:
     return a_start < b_end and b_start < a_end
 
 
 def mark_conflicts(events: list[Event]) -> list[Event]:
-    updated = [e.model_copy(deep=True) for e in events]
-    for e in updated:
-        e.conflict = False
-    timed = [e for e in updated if not e.all_day]
-    for i, a in enumerate(timed):
-        for b in timed[i + 1 :]:
-            if overlaps(a.start, a.end, b.start, b.end):
-                a.conflict = True
-                b.conflict = True
-    return updated
+    """Set ``conflict`` on timed events that overlap another timed event.
+
+    Avoids deep-copying the whole list; only copies events whose flag changes.
+    """
+    flags = [False] * len(events)
+    timed_idx = [i for i, e in enumerate(events) if not e.all_day]
+    for a, i in enumerate(timed_idx):
+        ei = events[i]
+        for j in timed_idx[a + 1 :]:
+            ej = events[j]
+            if overlaps(ei.start, ei.end, ej.start, ej.end):
+                flags[i] = True
+                flags[j] = True
+    out: list[Event] = []
+    for i, e in enumerate(events):
+        if e.conflict == flags[i]:
+            out.append(e)
+        else:
+            out.append(e.model_copy(update={"conflict": flags[i]}))
+    return out
 
 
 def available_qty(item, today: date) -> float:
@@ -132,13 +185,32 @@ def purchase_quantity(
     return qty
 
 
+def _consume_stock_for_uses(
+    uses: list[tuple[date, float]],
+    stock: float,
+    expiration: date | None,
+) -> list[tuple[date, float]]:
+    """Subtract fridge stock from meal uses; return uncovered (day, qty) rows."""
+    remaining: list[tuple[date, float]] = []
+    on_hand = max(0.0, stock)
+    for day, qty in uses:
+        if expiration is not None and expiration < day:
+            on_hand = 0.0
+        if on_hand >= qty:
+            on_hand -= qty
+            continue
+        need = qty - on_hand
+        on_hand = 0.0
+        remaining.append((day, need))
+    return remaining
+
+
 def free_windows_for_day(
     day_start: datetime,
     day_end: datetime,
     events: list[Event],
     min_hours: float,
 ) -> list[tuple[datetime, datetime]]:
-    """Return free intervals of at least min_hours within [day_start, day_end)."""
     blocking = sorted(
         [
             e
@@ -178,12 +250,13 @@ def find_non_overlapping_slot(
     search_start: datetime,
     search_end: datetime,
 ) -> tuple[datetime, datetime] | None:
-    """Prefer preferred_start; otherwise first free window that fits duration."""
     preferred_end = preferred_start + duration
     if (
         preferred_start >= search_start
         and preferred_end <= search_end
-        and not _timed_events_overlap_slot(events, preferred_start, preferred_end)
+        and not _timed_events_overlap_slot(
+            events, preferred_start, preferred_end
+        )
     ):
         return preferred_start, preferred_end
 
@@ -191,7 +264,6 @@ def find_non_overlapping_slot(
     for w_start, w_end in free_windows_for_day(
         search_start, search_end, events, min_hours
     ):
-        # Prefer a window that contains the preferred start when possible.
         if w_start <= preferred_start and preferred_start + duration <= w_end:
             return preferred_start, preferred_start + duration
         slot_end = w_start + duration
@@ -200,49 +272,23 @@ def find_non_overlapping_slot(
     return None
 
 
-def _lunch_break_bounds(
-    local_date: date, settings: AppSettings, tz: ZoneInfo | timezone
-) -> tuple[datetime, datetime]:
-    start = datetime(
-        local_date.year,
-        local_date.month,
-        local_date.day,
-        settings.lunch_hour,
-        0,
-        tzinfo=tz,
-    )
-    end = start + timedelta(minutes=settings.lunch_duration_min)
-    return start, end
-
-
-def _work_segments_around_lunch(
-    block_start: datetime,
-    block_end: datetime,
-    lunch_start: datetime,
-    lunch_end: datetime,
-) -> list[tuple[datetime, datetime]]:
-    """Split a work block so lunch 12–1 can sit inside a 9–5 day without overlap."""
-    if not overlaps(block_start, block_end, lunch_start, lunch_end):
-        return [(block_start, block_end)] if block_start < block_end else []
-    segments: list[tuple[datetime, datetime]] = []
-    if block_start < lunch_start:
-        segments.append((block_start, min(lunch_start, block_end)))
-    if lunch_end < block_end:
-        segments.append((max(lunch_end, block_start), block_end))
-    return [(s, e) for s, e in segments if s < e]
-
-
-def compute_week_summary(state: AppState, now: datetime) -> WeekSummary:
+def compute_week_summary(
+    state: AppState,
+    now: datetime,
+    week_start: datetime | None = None,
+    week_end: datetime | None = None,
+) -> WeekSummary:
     tz = _tz(state)
-    week_start, week_end = week_bounds(now, tz)
-    settings = state.settings
-    goal = settings.weekly_exercise_goal_hours
-    session_min = settings.session_min_hours
-    session_max = settings.session_max_hours
+    if week_start is None or week_end is None:
+        week_start, week_end = week_bounds(now, tz)
+    ex = rule_params(state, RuleKey.WEEKLY_EXERCISE_GOAL)
+    goal = _f(ex, "goal_hours", 10.0)
+    session_min = _f(ex, "session_min_hours", 1.0)
+    session_max = _f(ex, "session_max_hours", 3.0)
+    max_hours = _f(ex, "max_exercise_hours_per_day", 3.0)
 
     completed = 0.0
     planned = 0.0
-    walking_hours = 0.0
     exercise_events = [
         e
         for e in state.events
@@ -252,8 +298,6 @@ def compute_week_summary(state: AppState, now: datetime) -> WeekSummary:
     ]
     for e in exercise_events:
         h = hours_between(max(e.start, week_start), min(e.end, week_end))
-        if e.activity == Activity.WALKING:
-            walking_hours += h
         if e.completed or e.end <= now:
             completed += h
         else:
@@ -261,16 +305,11 @@ def compute_week_summary(state: AppState, now: datetime) -> WeekSummary:
 
     remaining = max(0.0, goal - completed - planned)
 
-    # Feasible days / max possible in free windows from now to week end
     feasible_days = 0
     max_possible = 0.0
     day = max(_as_local(now, tz), week_start)
-    # Snap to start of current local day hour for window search: use now as floor
-    while day.date() < week_end.date() or (
-        day.date() == (week_end - timedelta(seconds=1)).date()
-        and day < week_end
-    ):
-        local_day = day.date() if day.tzinfo else _as_local(day, tz).date()
+    while day < week_end:
+        local_day = _as_local(day, tz).date()
         day_start = datetime(
             local_day.year, local_day.month, local_day.day, 6, 0, tzinfo=tz
         )
@@ -287,26 +326,16 @@ def compute_week_summary(state: AppState, now: datetime) -> WeekSummary:
         day_capacity = 0.0
         for w_start, w_end in windows:
             day_capacity += min(session_max, hours_between(w_start, w_end))
-        # Cap by walking max remaining if only walking — capacity is general
+        day_capacity = min(day_capacity, max_hours)
         if day_capacity >= session_min:
             feasible_days += 1
             max_possible += day_capacity
         day = day_start + timedelta(days=1)
-        if day >= week_end:
-            break
 
-    if settings.walking_max_hours is not None:
-        # Capacity not further reduced here for mixed activities; walking
-        # suggestions respect the cap separately.
-        pass
-
-    # Sessions needed uses session max (ceil)
     if remaining <= 0:
         sessions_needed = 0
     else:
         sessions_needed = int(math.ceil(remaining / session_max))
-
-    feasible = remaining <= max_possible + 1e-6
 
     return WeekSummary(
         completed_hours=round(completed, 2),
@@ -314,505 +343,74 @@ def compute_week_summary(state: AppState, now: datetime) -> WeekSummary:
         remaining_hours=round(remaining, 2),
         sessions_needed=sessions_needed,
         feasible_days=feasible_days,
-        feasible=feasible,
+        feasible=remaining <= max_possible + 1e-6,
         max_possible_hours=round(max_possible, 2),
         goal_hours=goal,
     )
 
 
-def _dismissal_blocks(
-    state: AppState, rule_id: str, fingerprint: str
-) -> bool:
-    for d in state.dismissals:
-        if d.rule_id != rule_id:
+def _exercise_hours_before(
+    state: AppState,
+    local_date: date,
+    before: datetime,
+    tz: ZoneInfo | timezone,
+) -> tuple[float, float]:
+    """Return (total exercise hours, cycling hours) on local_date before ``before``."""
+    total = 0.0
+    cycling = 0.0
+    for e in state.events:
+        if e.type != EventType.EXERCISE:
             continue
-        if d.mode == "suppress":
-            return True
-        if d.mode == "ignore" and d.condition_fingerprint == fingerprint:
-            return True
-    return False
-
-
-def _protein_rich_recipes(state: AppState) -> list:
-    recipes = sorted(state.recipes, key=lambda r: r.protein_g, reverse=True)
-    return recipes
-
-
-def evaluate_rules(state: AppState, now: datetime, summary: WeekSummary) -> tuple[list[Suggestion], list[Suggestion]]:
-    tz = _tz(state)
-    suggestions: list[Suggestion] = []
-    warnings: list[Suggestion] = []
-    settings = state.settings
-    week_start, week_end = week_bounds(now, tz)
-    today_local = _as_local(now, tz).date()
-    day_start = datetime(
-        today_local.year, today_local.month, today_local.day, tzinfo=tz
-    )
-    day_end = day_start + timedelta(days=1)
-
-    enabled = [r for r in state.rules if r.enabled]
-    enabled.sort(key=lambda r: (-r.priority, 0 if r.strength.value == "mandatory" else 1))
-
-    exercise_today = [
-        e
-        for e in state.events
-        if e.type == EventType.EXERCISE and overlaps(e.start, e.end, day_start, day_end)
-    ]
-    sporting_today = [
-        e
-        for e in state.events
-        if e.type == EventType.SPORTING and overlaps(e.start, e.end, day_start, day_end)
-    ]
-    exercise_hours_today = sum(hours_between(e.start, e.end) for e in exercise_today)
-    sporting_hours_today = sum(hours_between(e.start, e.end) for e in sporting_today)
-    cycling_hours_today = sum(
-        hours_between(e.start, e.end)
-        for e in exercise_today
-        if e.activity == Activity.CYCLING
-    )
-
-    walking_week = sum(
-        hours_between(e.start, e.end)
-        for e in state.events
-        if e.type == EventType.EXERCISE
-        and e.activity == Activity.WALKING
-        and overlaps(e.start, e.end, week_start, week_end)
-    )
-
-    for rule in enabled:
-        if rule.condition_key == "session_too_short":
-            for e in state.events:
-                if e.type != EventType.EXERCISE:
-                    continue
-                h = hours_between(e.start, e.end)
-                if h < settings.session_min_hours:
-                    fp = f"short:{e.id}"
-                    if _dismissal_blocks(state, rule.id, fp):
-                        continue
-                    warnings.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.WARNING,
-                            explanation=rule.explanation,
-                            title=f"{e.title} is under the session minimum",
-                            proposed={"event_id": e.id, "hours": h},
-                            actions=["accept", "modify"]
-                            if not rule.overridable
-                            else ["accept", "modify", "ignore", "suppress"],
-                        )
-                    )
-
-        elif rule.condition_key == "session_too_long":
-            for e in state.events:
-                if e.type != EventType.EXERCISE:
-                    continue
-                h = hours_between(e.start, e.end)
-                if h > settings.session_max_hours:
-                    fp = f"long:{e.id}"
-                    if _dismissal_blocks(state, rule.id, fp):
-                        continue
-                    warnings.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.WARNING,
-                            explanation=rule.explanation,
-                            title=f"{e.title} exceeds the session maximum",
-                            proposed={"event_id": e.id, "hours": h},
-                            actions=["accept", "modify"]
-                            if not rule.overridable
-                            else ["accept", "modify", "ignore", "suppress"],
-                        )
-                    )
-
-        elif rule.condition_key == "walking_over_cap":
-            cap = settings.walking_max_hours
-            if cap is not None and walking_week > cap:
-                fp = f"walk:{week_start.date()}:{walking_week}"
-                if not _dismissal_blocks(state, rule.id, fp):
-                    warnings.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.WARNING,
-                            explanation=rule.explanation,
-                            title=f"Walking {walking_week:.1f}h exceeds cap {cap}h",
-                            proposed={"walking_hours": walking_week},
-                            actions=["accept", "modify"],
-                        )
-                    )
-
-        elif rule.condition_key == "exercise_below_goal":
-            if (
-                summary.remaining_hours > 0
-                and summary.feasible_days >= 1
-            ):
-                fp = f"goal:{week_start.date()}:{summary.remaining_hours}"
-                if _dismissal_blocks(state, rule.id, fp):
-                    continue
-                # Propose sessions that close the gap
-                gap = summary.remaining_hours
-                if 0 < gap < settings.session_min_hours:
-                    duration = settings.session_min_hours
-                else:
-                    duration = min(settings.session_max_hours, max(settings.session_min_hours, gap))
-                # Find a free window
-                proposed_start = None
-                proposed_end = None
-                day = max(_as_local(now, tz), week_start)
-                while day < week_end and proposed_start is None:
-                    local_day = _as_local(day, tz).date()
-                    ds = datetime(local_day.year, local_day.month, local_day.day, 6, 0, tzinfo=tz)
-                    de = datetime(local_day.year, local_day.month, local_day.day, 22, 0, tzinfo=tz)
-                    if de <= now:
-                        day = ds + timedelta(days=1)
-                        continue
-                    for w_start, w_end in free_windows_for_day(
-                        max(ds, now), de, state.events, settings.session_min_hours
-                    ):
-                        slot_end = w_start + timedelta(hours=duration)
-                        if slot_end <= w_end:
-                            proposed_start = w_start
-                            proposed_end = slot_end
-                            break
-                    day = ds + timedelta(days=1)
-
-                if proposed_start is not None:
-                    for activity in (Activity.CYCLING, Activity.GYM, Activity.WALKING):
-                        if (
-                            activity == Activity.WALKING
-                            and settings.walking_max_hours is not None
-                            and walking_week + duration > settings.walking_max_hours
-                        ):
-                            continue
-                        suggestions.append(
-                            Suggestion(
-                                rule_id=rule.id,
-                                kind=SuggestionKind.EXERCISE,
-                                explanation=(
-                                    f"{rule.explanation} "
-                                    f"Remaining {summary.remaining_hours:.1f}h toward "
-                                    f"{summary.goal_hours:.0f}h goal."
-                                ),
-                                title=f"{activity.value.title()} — {duration:.1f}h",
-                                proposed={
-                                    "type": "exercise",
-                                    "title": activity.value.title(),
-                                    "activity": activity.value,
-                                    "start": proposed_start.isoformat(),
-                                    "end": proposed_end.isoformat(),
-                                    "fingerprint": fp,
-                                },
-                            )
-                        )
-                        break  # one placement slot; prefer cycling
-
-        elif rule.condition_key == "sport_below_threshold":
-            if sporting_hours_today < settings.activity_threshold_hours:
-                fp = f"sport_low:{today_local}"
-                if _dismissal_blocks(state, rule.id, fp):
-                    continue
-                rich = _protein_rich_recipes(state)
-                if rich:
-                    suggestions.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.MEAL,
-                            explanation=rule.explanation,
-                            title=f"Protein-rich: {rich[0].name}",
-                            proposed={
-                                "type": "meal",
-                                "recipe_id": rich[0].id,
-                                "title": rich[0].name,
-                                "fingerprint": fp,
-                            },
-                        )
-                    )
-
-        elif rule.condition_key == "exercise_below_threshold":
-            if exercise_hours_today < settings.activity_threshold_hours:
-                fp = f"ex_low:{today_local}"
-                if _dismissal_blocks(state, rule.id, fp):
-                    continue
-                rich = _protein_rich_recipes(state)
-                if rich:
-                    suggestions.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.MEAL,
-                            explanation=rule.explanation,
-                            title=f"Protein-rich: {rich[0].name}",
-                            proposed={
-                                "type": "meal",
-                                "recipe_id": rich[0].id,
-                                "title": rich[0].name,
-                                "fingerprint": fp,
-                            },
-                        )
-                    )
-
-        elif rule.condition_key == "exercise_at_threshold":
-            if (
-                exercise_hours_today >= settings.activity_threshold_hours
-                and settings.protein_target_g is not None
-            ):
-                fp = f"ex_hi:{today_local}"
-                if _dismissal_blocks(state, rule.id, fp):
-                    continue
-                matches = [
-                    r
-                    for r in state.recipes
-                    if r.protein_g >= settings.protein_target_g
-                ]
-                if matches:
-                    suggestions.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.MEAL,
-                            explanation=(
-                                f"{rule.explanation} Protein target "
-                                f"{settings.protein_target_g}g."
-                            ),
-                            title=matches[0].name,
-                            proposed={
-                                "type": "meal",
-                                "recipe_id": matches[0].id,
-                                "title": matches[0].name,
-                                "fingerprint": fp,
-                            },
-                        )
-                    )
-
-        elif rule.condition_key == "cycling_at_threshold":
-            if (
-                cycling_hours_today >= settings.activity_threshold_hours
-                and settings.protein_target_g is not None
-                and settings.carbohydrate_target_g is not None
-            ):
-                fp = f"cyc_hi:{today_local}"
-                if _dismissal_blocks(state, rule.id, fp):
-                    continue
-                matches = [
-                    r
-                    for r in state.recipes
-                    if r.protein_g >= settings.protein_target_g
-                    and r.carbohydrates_g >= settings.carbohydrate_target_g
-                ]
-                if matches:
-                    suggestions.append(
-                        Suggestion(
-                            rule_id=rule.id,
-                            kind=SuggestionKind.MEAL,
-                            explanation=rule.explanation,
-                            title=matches[0].name,
-                            proposed={
-                                "type": "meal",
-                                "recipe_id": matches[0].id,
-                                "title": matches[0].name,
-                                "fingerprint": fp,
-                            },
-                        )
-                    )
-
-        elif rule.condition_key == "stock_at_or_below_min":
-            # Handled after shopping recompute via warnings for low projected stock
-            pass
-
-    return suggestions, warnings
-
-
-def recompute_shopping_and_reminders(
-    state: AppState, now: datetime
-) -> tuple[list[ShoppingLine], list[Event], list[Suggestion]]:
-    tz = _tz(state)
-    settings = state.settings
-    today = _as_local(now, tz).date()
-    recipes = {r.id: r for r in state.recipes}
-    inv_by_name = {i.name.lower(): i for i in state.fridge}
-
-    demand: dict[str, float] = defaultdict(float)
-    demand_unit: dict[str, Unit] = {}
-    meal_timeline: list[tuple[datetime, dict[str, float]]] = []
-
-    for e in sorted(
-        [ev for ev in state.events if ev.type == EventType.MEAL and not ev.eaten],
-        key=lambda x: x.start,
-    ):
-        recipe = recipes.get(e.recipe_id or "")
-        if not recipe:
+        if _as_local(e.start, tz).date() != local_date:
             continue
-        meal_demand: dict[str, float] = defaultdict(float)
-        for line in recipe.ingredients:
-            key = line.name
-            qty = line.quantity * e.portions
-            demand[key] += qty
-            demand_unit[key] = line.unit
-            meal_demand[key] += qty
-        meal_timeline.append((e.start, dict(meal_demand)))
-
-    checked = [s for s in state.shopping if s.checked]
-    checked_names = {s.ingredient.lower() for s in checked}
-    new_lines: list[ShoppingLine] = list(checked)
-
-    for name, required in demand.items():
-        item = inv_by_name.get(name.lower())
-        available = available_qty(item, today) if item else 0.0
-        minimum = item.minimum_quantity if item else 0.0
-        replenish = item.replenishment_quantity if item else 0.0
-        unit = demand_unit.get(name, Unit.G)
-        qty = purchase_quantity(required, available, minimum, replenish)
-        if qty > 0 and name.lower() not in checked_names:
-            new_lines.append(
-                ShoppingLine(
-                    ingredient=name,
-                    quantity=qty,
-                    unit=unit,
-                    checked=False,
-                )
-            )
-
-    # Earliest day each ingredient would hit the minimum (from meal plan).
-    stock = {
-        name: available_qty(item, today) for name, item in inv_by_name.items()
-    }
-    for name in demand:
-        stock.setdefault(name.lower(), 0.0)
-
-    runout_day: dict[str, date] = {}
-    for meal_start, meal_demand in meal_timeline:
-        for name, qty in meal_demand.items():
-            key = name.lower()
-            before = stock.get(key, 0.0)
-            after = before - qty
-            item = inv_by_name.get(key)
-            min_q = item.minimum_quantity if item else 0.0
-            if before > min_q and after <= min_q and key not in runout_day:
-                runout_day[key] = _as_local(meal_start, tz).date()
-            stock[key] = after
-
-    # Open lines with the day they must be bought by (need day).
-    pending: list[tuple[date, str, float, Unit]] = []
-    for line in new_lines:
-        if line.checked:
+        if e.end > before:
             continue
-        key = line.ingredient.lower()
-        need = runout_day.get(key, today)
-        if need < today:
-            need = today
-        pending.append((need, line.ingredient, line.quantity, line.unit))
-
-    shopping_days: dict[date, list[tuple[str, float, Unit]]] = defaultdict(list)
-    batch = _action_enabled(state, "batch_shopping")
-    if batch and pending:
-        lead = max(0, state.settings.shopping_lead_days)
-        batch_days = max(1, state.settings.shopping_batch_days)
-        remaining = sorted(pending, key=lambda row: (row[0], row[1].lower()))
-        while remaining:
-            first_need = remaining[0][0]
-            trip_day = first_need - timedelta(days=lead)
-            if trip_day < today:
-                trip_day = today
-            cover_until = trip_day + timedelta(days=batch_days)
-            covered: list[tuple[date, str, float, Unit]] = []
-            leftover: list[tuple[date, str, float, Unit]] = []
-            for row in remaining:
-                # Include anything already due, or needed before the next batch window.
-                if row[0] < cover_until:
-                    covered.append(row)
-                else:
-                    leftover.append(row)
-            if not covered:
-                covered = [remaining[0]]
-                leftover = remaining[1:]
-            for _need, name, qty, unit in covered:
-                shopping_days[trip_day].append((name, qty, unit))
-            remaining = leftover
-    else:
-        for need, name, qty, unit in pending:
-            shopping_days[need].append((name, qty, unit))
-
-    # Remove old auto shopping reminders; keep user ones
-    kept_events = [
-        e
-        for e in state.events
-        if not (e.type == EventType.SHOPPING and e.origin == Origin.AUTO)
-    ]
-    shop_duration = timedelta(minutes=max(15, settings.shopping_duration_min))
-    earliest = max(0, min(23, settings.exercise_earliest_hour))
-    for day, items in sorted(shopping_days.items()):
-        parts = [f"{n} {q:g}{u.value}" for n, q, u in items]
-        title = "Shopping — " + ", ".join(parts)
-        if len(title) > 80:
-            title = f"Shopping — {len(items)} items"
-        # Prefer a free timed slot outside work (evening, or weekend morning).
-        preferred_hour = 10 if day.weekday() >= 5 else 17
-        preferred = datetime(day.year, day.month, day.day, preferred_hour, 0, tzinfo=tz)
-        search_start = datetime(day.year, day.month, day.day, earliest, 0, tzinfo=tz)
-        search_end = datetime(day.year, day.month, day.day, 22, 0, tzinfo=tz)
-        slot = find_non_overlapping_slot(
-            preferred, shop_duration, kept_events, search_start, search_end
-        )
-        if slot is None:
-            # Try following days for a free shopping window.
-            for offset in range(1, 8):
-                alt = day + timedelta(days=offset)
-                preferred = datetime(
-                    alt.year, alt.month, alt.day,
-                    10 if alt.weekday() >= 5 else 17, 0, tzinfo=tz,
-                )
-                search_start = datetime(
-                    alt.year, alt.month, alt.day, earliest, 0, tzinfo=tz
-                )
-                search_end = datetime(alt.year, alt.month, alt.day, 22, 0, tzinfo=tz)
-                slot = find_non_overlapping_slot(
-                    preferred, shop_duration, kept_events, search_start, search_end
-                )
-                if slot is not None:
-                    break
-        if slot is None:
-            continue
-        start, end = slot
-        kept_events.append(
-            Event(
-                id=new_id(),
-                title=title,
-                type=EventType.SHOPPING,
-                start=start,
-                end=end,
-                all_day=False,
-                origin=Origin.AUTO,
-                ingredient_name=items[0][0] if len(items) == 1 else None,
-            )
-        )
-
-    return new_lines, kept_events, []
+        h = hours_between(e.start, e.end)
+        total += h
+        if e.activity == Activity.CYCLING:
+            cycling += h
+    return total, cycling
 
 
-ROUTINE_WORK_TITLE = "Work"
+def _pick_recipe(
+    state: AppState,
+    meal_type: str,
+    *,
+    slot_key: str = "",
+    used_ids: set[str] | None = None,
+    allow_repeat: bool = False,
+    prefer_protein: bool = False,
+    prefer_carb_protein: bool = False,
+) -> str | None:
+    """Pick a recipe for a meal slot.
 
-
-def _action_enabled(state: AppState, action_key: str) -> bool:
-    """True when an enabled rule with this action exists, or no such rule is defined yet."""
-    matching = [r for r in state.rules if r.action_key == action_key]
-    if not matching:
-        return True
-    return any(r.enabled for r in matching)
-
-
-def _is_routine_event(e: Event) -> bool:
-    if e.origin != Origin.AUTO:
-        return False
-    if e.type == EventType.PERSONAL and e.title == ROUTINE_WORK_TITLE:
-        return True
-    # Auto meal slots are rebuilt each recalculation (user overrides keep origin=user).
-    if e.type == EventType.MEAL:
-        return True
-    return False
-
-
-def _pick_recipe(state: AppState, meal_type: str) -> str | None:
+    Selection is random but stable for ``slot_key`` so recalculation does
+    not reshuffle the week. Lunch/dinner never reuse a recipe already
+    placed this week; breakfast may repeat. After exercise, narrows to
+    top protein/carb candidates among the remaining pool.
+    """
     typed = [r for r in state.recipes if r.meal_type.lower() == meal_type]
-    if typed:
-        return typed[0].id
-    return state.recipes[0].id if state.recipes else None
+    pool = typed or list(state.recipes)
+    if not pool:
+        return None
+    used = used_ids or set()
+    fresh = [r for r in pool if r.id not in used]
+    if fresh:
+        pool = fresh
+    elif not allow_repeat:
+        return None
+    if prefer_carb_protein:
+        pool = sorted(
+            pool,
+            key=lambda r: (r.carbohydrates_g + r.protein_g, r.protein_g),
+            reverse=True,
+        )
+        pool = pool[: max(1, min(3, len(pool)))]
+    elif prefer_protein:
+        pool = sorted(pool, key=lambda r: r.protein_g, reverse=True)
+        pool = pool[: max(1, min(3, len(pool)))]
+    rng = random.Random(slot_key or meal_type)
+    return rng.choice(pool).id
 
 
 def _user_meal_covers_slot(
@@ -821,7 +419,6 @@ def _user_meal_covers_slot(
     hour: int,
     tz: ZoneInfo | timezone,
 ) -> bool:
-    """True when the user already placed a meal on this day for this slot hour."""
     for e in events:
         if e.type != EventType.MEAL or e.origin != Origin.USER:
             continue
@@ -843,39 +440,117 @@ def _user_work_on_day(
     return False
 
 
-def apply_work_and_meals(state: AppState, now: datetime) -> AppState:
-    """Upsert auto work blocks and breakfast/lunch/dinner for the current week.
+def _user_study_on_day(
+    events: list[Event], local_date: date, tz: ZoneInfo | timezone
+) -> bool:
+    for e in events:
+        if e.origin != Origin.USER:
+            continue
+        if e.type == EventType.PERSONAL and e.title == ROUTINE_STUDY_TITLE:
+            if _as_local(e.start, tz).date() == local_date:
+                return True
+    return False
 
-    Work hours are placed in full (split around lunch). Meals and later exercise
-    must fit free windows — work is never shrunk to make room for exercise.
-    """
+
+def _is_routine_event(e: Event) -> bool:
+    if e.origin != Origin.AUTO:
+        return False
+    if e.type == EventType.PERSONAL and e.title in (
+        ROUTINE_WORK_TITLE,
+        ROUTINE_STUDY_TITLE,
+    ):
+        return True
+    if e.type == EventType.MEAL:
+        return True
+    return False
+
+
+def _lunch_break_bounds(
+    local_date: date,
+    meals: dict[str, Any],
+    tz: ZoneInfo | timezone,
+) -> tuple[datetime, datetime]:
+    start = datetime(
+        local_date.year,
+        local_date.month,
+        local_date.day,
+        _i(meals, "lunch_hour", 12),
+        0,
+        tzinfo=tz,
+    )
+    end = start + timedelta(minutes=_i(meals, "lunch_duration_min", 60))
+    return start, end
+
+
+def _work_segments_around_lunch(
+    block_start: datetime,
+    block_end: datetime,
+    lunch_start: datetime,
+    lunch_end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    if not overlaps(block_start, block_end, lunch_start, lunch_end):
+        return [(block_start, block_end)] if block_start < block_end else []
+    segments: list[tuple[datetime, datetime]] = []
+    if block_start < lunch_start:
+        segments.append((block_start, min(lunch_start, block_end)))
+    if lunch_end < block_end:
+        segments.append((max(lunch_end, block_start), block_end))
+    return [(s, e) for s, e in segments if s < e]
+
+
+def apply_work_and_meals(
+    state: AppState, now: datetime, through: date | None = None
+) -> AppState:
+    """Upsert Auto work, study, and meal slots over the planning horizon."""
     tz = _tz(state)
-    week_start, week_end = week_bounds(now, tz)
-    settings = state.settings
+    horizon_start, horizon_end = planning_horizon(now, tz, through=through)
+    meals = rule_params(state, RuleKey.DAILY_MEALS)
+    work = rule_params(state, RuleKey.WORK_SCHEDULE)
+    study = rule_params(state, RuleKey.STUDY_SCHEDULE)
+    ex = rule_params(state, RuleKey.WEEKLY_EXERCISE_GOAL)
     state = state.model_copy(deep=True)
-    state.events = [e for e in state.events if not _is_routine_event(e)]
+    state.events = [
+        e
+        for e in state.events
+        if not (
+            _is_routine_event(e)
+            and e.start < horizon_end
+            and e.end > horizon_start
+        )
+    ]
 
-    place_work = _action_enabled(state, "place_work_blocks")
-    place_meals = _action_enabled(state, "place_daily_meals")
-    if not place_work and not place_meals:
+    place_work = rule_enabled(state, RuleKey.WORK_SCHEDULE)
+    place_study = rule_enabled(state, RuleKey.STUDY_SCHEDULE)
+    place_meals = rule_enabled(state, RuleKey.DAILY_MEALS)
+    if not place_work and not place_study and not place_meals:
         return state
 
-    earliest = max(0, min(23, settings.exercise_earliest_hour))
-    day = week_start
-    while day < week_end:
+    earliest = max(0, min(23, _i(ex, "exercise_earliest_hour", 7)))
+    threshold = _f(meals, "activity_threshold_hours", 2.0)
+    day = horizon_start
+    while day < horizon_end:
         local_date = _as_local(day, tz).date()
         weekday = local_date.weekday()
         day_search_start = datetime(
-            local_date.year, local_date.month, local_date.day, earliest, 0, tzinfo=tz
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            earliest,
+            0,
+            tzinfo=tz,
         )
         day_search_end = datetime(
-            local_date.year, local_date.month, local_date.day, 22, 0, tzinfo=tz
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            22,
+            0,
+            tzinfo=tz,
         )
-        lunch_start, lunch_end = _lunch_break_bounds(local_date, settings, tz)
+        lunch_start, lunch_end = _lunch_break_bounds(local_date, meals, tz)
 
-        # Full work blocks first (mandatory schedule).
         if place_work and not _user_work_on_day(state.events, local_date, tz):
-            for block in settings.work_blocks:
+            for block in work_blocks_from_params(work):
                 if block.weekday != weekday:
                     continue
                 start_h = int(block.start_hour)
@@ -883,12 +558,20 @@ def apply_work_and_meals(state: AppState, now: datetime) -> AppState:
                 end_h = int(block.end_hour)
                 end_m = int(round((block.end_hour - end_h) * 60))
                 block_start = datetime(
-                    local_date.year, local_date.month, local_date.day,
-                    start_h, start_m, tzinfo=tz,
+                    local_date.year,
+                    local_date.month,
+                    local_date.day,
+                    start_h,
+                    start_m,
+                    tzinfo=tz,
                 )
                 block_end = datetime(
-                    local_date.year, local_date.month, local_date.day,
-                    end_h, end_m, tzinfo=tz,
+                    local_date.year,
+                    local_date.month,
+                    local_date.day,
+                    end_h,
+                    end_m,
+                    tzinfo=tz,
                 )
                 for seg_start, seg_end in _work_segments_around_lunch(
                     block_start, block_end, lunch_start, lunch_end
@@ -903,24 +586,120 @@ def apply_work_and_meals(state: AppState, now: datetime) -> AppState:
                         )
                     )
 
+        if place_study and not _user_study_on_day(
+            state.events, local_date, tz
+        ):
+            for block in study_blocks_from_params(study):
+                if block.weekday != weekday:
+                    continue
+                start_h = int(block.start_hour)
+                start_m = int(round((block.start_hour - start_h) * 60))
+                end_h = int(block.end_hour)
+                end_m = int(round((block.end_hour - end_h) * 60))
+                block_start = datetime(
+                    local_date.year,
+                    local_date.month,
+                    local_date.day,
+                    start_h,
+                    start_m,
+                    tzinfo=tz,
+                )
+                block_end = datetime(
+                    local_date.year,
+                    local_date.month,
+                    local_date.day,
+                    end_h,
+                    end_m,
+                    tzinfo=tz,
+                )
+                if block_start >= block_end:
+                    continue
+                state.events.append(
+                    Event(
+                        title=ROUTINE_STUDY_TITLE,
+                        type=EventType.PERSONAL,
+                        start=block_start,
+                        end=block_end,
+                        origin=Origin.AUTO,
+                    )
+                )
+
         if place_meals:
             meal_slots = [
-                ("Breakfast", settings.breakfast_hour, "breakfast", settings.meal_duration_min),
-                ("Lunch", settings.lunch_hour, "lunch", settings.lunch_duration_min),
-                ("Dinner", settings.dinner_hour, "dinner", settings.meal_duration_min),
+                (
+                    "Breakfast",
+                    _i(meals, "breakfast_hour", 8),
+                    "breakfast",
+                    _i(meals, "meal_duration_min", 45),
+                ),
+                (
+                    "Lunch",
+                    _i(meals, "lunch_hour", 12),
+                    "lunch",
+                    _i(meals, "lunch_duration_min", 60),
+                ),
+                (
+                    "Dinner",
+                    _i(meals, "dinner_hour", 18),
+                    "dinner",
+                    _i(meals, "meal_duration_min", 45),
+                ),
             ]
+            # Uniqueness is per calendar week: lunch/dinner never repeat
+            # within Mon–Sun; breakfast may. Scope to this week only so
+            # the planning horizon can reuse recipes in later weeks.
+            week_monday = local_date - timedelta(days=weekday)
+            week_end_date = week_monday + timedelta(days=7)
+            used_recipe_ids = {
+                e.recipe_id
+                for e in state.events
+                if e.type == EventType.MEAL
+                and e.recipe_id
+                and week_monday
+                <= _as_local(e.start, tz).date()
+                < week_end_date
+            }
             for title, hour, meal_type, duration_min in meal_slots:
                 if _user_meal_covers_slot(state.events, local_date, hour, tz):
                     continue
-                recipe_id = _pick_recipe(state, meal_type)
+                preferred = datetime(
+                    local_date.year,
+                    local_date.month,
+                    local_date.day,
+                    hour,
+                    0,
+                    tzinfo=tz,
+                )
+                ex_h, cyc_h = _exercise_hours_before(
+                    state, local_date, preferred, tz
+                )
+                prefer_carb = cyc_h >= threshold
+                prefer_protein = ex_h >= threshold
+                allow_repeat = meal_type == "breakfast"
+                slot_key = f"{local_date.isoformat()}:{meal_type}"
+                recipe_id = _pick_recipe(
+                    state,
+                    meal_type,
+                    slot_key=slot_key,
+                    used_ids=used_recipe_ids,
+                    allow_repeat=allow_repeat,
+                    prefer_protein=prefer_protein and not prefer_carb,
+                    prefer_carb_protein=prefer_carb,
+                )
                 if not recipe_id and meal_type == "lunch":
-                    recipe_id = _pick_recipe(state, "dinner")
+                    recipe_id = _pick_recipe(
+                        state,
+                        "dinner",
+                        slot_key=f"{slot_key}:fallback",
+                        used_ids=used_recipe_ids,
+                        allow_repeat=False,
+                        prefer_protein=prefer_protein and not prefer_carb,
+                        prefer_carb_protein=prefer_carb,
+                    )
                 if not recipe_id:
                     continue
-                recipe = next((r for r in state.recipes if r.id == recipe_id), None)
-                preferred = datetime(
-                    local_date.year, local_date.month, local_date.day,
-                    hour, 0, tzinfo=tz,
+                recipe = next(
+                    (r for r in state.recipes if r.id == recipe_id), None
                 )
                 slot = find_non_overlapping_slot(
                     preferred,
@@ -932,6 +711,7 @@ def apply_work_and_meals(state: AppState, now: datetime) -> AppState:
                 if slot is None:
                     continue
                 start, end = slot
+                used_recipe_ids.add(recipe_id)
                 state.events.append(
                     Event(
                         title=recipe.name if recipe else title,
@@ -955,7 +735,138 @@ def _exercise_count_on_date(
     return sum(
         1
         for e in events
-        if e.type == EventType.EXERCISE and _as_local(e.start, tz).date() == day
+        if e.type == EventType.EXERCISE
+        and _as_local(e.start, tz).date() == day
+    )
+
+
+def _exercise_hours_on_date(
+    events: list[Event], day: date, tz: ZoneInfo | timezone
+) -> float:
+    return sum(
+        hours_between(e.start, e.end)
+        for e in events
+        if e.type == EventType.EXERCISE
+        and _as_local(e.start, tz).date() == day
+    )
+
+
+def _no_morning_weekdays(ex: dict[str, Any]) -> set[int]:
+    raw = ex.get("no_morning_weekdays")
+    if not isinstance(raw, list):
+        raw = [0, 3]
+    return {int(x) for x in raw}
+
+
+def _exercise_window_for_activity(
+    local_day: date,
+    activity: Activity,
+    ex: dict[str, Any],
+    tz: ZoneInfo | timezone,
+) -> tuple[datetime, datetime] | None:
+    """Allowed search window for Auto exercise of ``activity`` on ``local_day``."""
+    earliest = max(0, min(23, _i(ex, "exercise_earliest_hour", 7)))
+    morning_end = max(
+        earliest + 1, min(23, _i(ex, "morning_end_hour", 12))
+    )
+    cycling_latest = max(
+        morning_end, min(24, _i(ex, "cycling_latest_end_hour", 20))
+    )
+    day_end_h = 22
+
+    if activity == Activity.CYCLING:
+        # Cycling is never morning; evening sessions must end by cycling_latest.
+        start_h = morning_end
+        end_h = min(day_end_h, cycling_latest)
+    else:
+        # Gym: morning allowed except Mon/Thu; may run through day end.
+        if local_day.weekday() in _no_morning_weekdays(ex):
+            start_h = morning_end
+        else:
+            start_h = earliest
+        end_h = day_end_h
+
+    if end_h <= start_h:
+        return None
+    return (
+        datetime(
+            local_day.year,
+            local_day.month,
+            local_day.day,
+            start_h,
+            0,
+            tzinfo=tz,
+        ),
+        datetime(
+            local_day.year,
+            local_day.month,
+            local_day.day,
+            end_h,
+            0,
+            tzinfo=tz,
+        ),
+    )
+
+
+def _preferred_exercise_start(
+    local_day: date,
+    activity: Activity,
+    window_start: datetime,
+    floor: datetime,
+    ex: dict[str, Any],
+    tz: ZoneInfo | timezone,
+) -> datetime:
+    earliest = max(0, min(23, _i(ex, "exercise_earliest_hour", 7)))
+    morning_end = max(
+        earliest + 1, min(23, _i(ex, "morning_end_hour", 12))
+    )
+    evening_start = max(
+        morning_end, min(22, _i(ex, "evening_start_hour", 17))
+    )
+    # Weekends: morning gym when allowed; otherwise afternoon.
+    # Weekdays: prefer evening.
+    if local_day.weekday() >= 5 and activity == Activity.GYM:
+        preferred_h = max(earliest, 9)
+    elif local_day.weekday() >= 5:
+        preferred_h = max(morning_end, 9)
+    else:
+        preferred_h = evening_start
+    preferred = datetime(
+        local_day.year,
+        local_day.month,
+        local_day.day,
+        preferred_h,
+        0,
+        tzinfo=tz,
+    )
+    return max(floor, window_start, preferred)
+
+
+def _try_place_exercise(
+    local_day: date,
+    duration_h: float,
+    events: list[Event],
+    now: datetime,
+    activity: Activity,
+    ex: dict[str, Any],
+    tz: ZoneInfo | timezone,
+) -> tuple[datetime, datetime] | None:
+    window = _exercise_window_for_activity(local_day, activity, ex, tz)
+    if window is None:
+        return None
+    ds, de = window
+    if de <= now:
+        return None
+    floor = max(ds, now) if local_day == _as_local(now, tz).date() else ds
+    if floor >= de:
+        return None
+    preferred = _preferred_exercise_start(
+        local_day, activity, ds, floor, ex, tz
+    )
+    if preferred >= de:
+        preferred = floor
+    return find_non_overlapping_slot(
+        preferred, timedelta(hours=duration_h), events, floor, de
     )
 
 
@@ -980,9 +891,12 @@ def _dedupe_identical_events(events: list[Event]) -> list[Event]:
 
 
 def _candidate_exercise_days(
-    week_start: datetime, week_end: datetime, tz: ZoneInfo | timezone, now: datetime
+    week_start: datetime,
+    week_end: datetime,
+    tz: ZoneInfo | timezone,
+    now: datetime,
 ) -> list[date]:
-    """Weekends first, then weekdays — use Sat/Sun for volume."""
+    """Remaining days this week from today, chronological (one session/day)."""
     days: list[date] = []
     d = _as_local(week_start, tz).date()
     end = _as_local(week_end - timedelta(seconds=1), tz).date()
@@ -990,221 +904,836 @@ def _candidate_exercise_days(
         days.append(d)
         d += timedelta(days=1)
     today = _as_local(now, tz).date()
-    days = [x for x in days if x >= today]
-    weekends = [x for x in days if x.weekday() >= 5]
-    weekdays = [x for x in days if x.weekday() < 5]
-    return weekends + weekdays
+    return [x for x in days if x >= today]
 
 
-def repair_exercise_events(state: AppState, now: datetime) -> AppState:
-    """Move exercise out of work/meals; enforce ≤1 block per weekday."""
+def repair_exercise_events(
+    state: AppState, now: datetime, through: date | None = None
+) -> AppState:
+    """Move Auto exercise out of conflicts; never move User exercise."""
     tz = _tz(state)
-    settings = state.settings
-    earliest = max(0, min(23, settings.exercise_earliest_hour))
-    week_start, week_end = week_bounds(now, tz)
+    ex = rule_params(state, RuleKey.WEEKLY_EXERCISE_GOAL)
+    max_blocks = _i(ex, "max_exercise_blocks_per_day", 1)
+    max_hours = _f(ex, "max_exercise_hours_per_day", 3.0)
+    horizon_start, horizon_end = planning_horizon(now, tz, through=through)
     state = state.model_copy(deep=True)
 
-    others = [e for e in state.events if e.type != EventType.EXERCISE]
-    exercises = sorted(
-        [e for e in state.events if e.type == EventType.EXERCISE],
+    user_ex = [
+        e
+        for e in state.events
+        if e.type == EventType.EXERCISE and e.origin != Origin.AUTO
+    ]
+    auto_ex = sorted(
+        [
+            e
+            for e in state.events
+            if e.type == EventType.EXERCISE and e.origin == Origin.AUTO
+        ],
         key=lambda e: (e.start, e.id),
     )
-    placed: list[Event] = list(others)
-    weekday_counts: dict[date, int] = defaultdict(int)
+    others = [e for e in state.events if e.type != EventType.EXERCISE]
+    placed: list[Event] = list(others) + list(user_ex)
+    day_counts: dict[date, int] = defaultdict(int)
+    day_hours: dict[date, float] = defaultdict(float)
+    for e in user_ex:
+        local_day = _as_local(e.start, tz).date()
+        day_counts[local_day] += 1
+        day_hours[local_day] += hours_between(e.start, e.end)
 
-    for ex in exercises:
-        duration = ex.end - ex.start
+    for exercise in auto_ex:
+        duration = exercise.end - exercise.start
         if duration.total_seconds() <= 0:
             continue
-        local = _as_local(ex.start, tz)
+        dur_h = hours_between(exercise.start, exercise.end)
+        activity = exercise.activity or Activity.CYCLING
+        local = _as_local(exercise.start, tz)
         local_day = local.date()
-        is_weekday = local_day.weekday() < 5
-        day_start = datetime(
-            local_day.year, local_day.month, local_day.day, earliest, 0, tzinfo=tz
-        )
-        day_end = datetime(
-            local_day.year, local_day.month, local_day.day, 22, 0, tzinfo=tz
-        )
-        fits_here = (
-            ex.start >= day_start
-            and ex.end <= day_end
-            and not _timed_events_overlap_slot(placed, ex.start, ex.end)
-            and not (is_weekday and weekday_counts[local_day] >= settings.max_exercise_blocks_weekday)
-        )
+        window = _exercise_window_for_activity(local_day, activity, ex, tz)
+        fits_here = False
+        if window is not None:
+            day_start, day_end = window
+            fits_here = (
+                exercise.start >= day_start
+                and exercise.end <= day_end
+                and not _timed_events_overlap_slot(
+                    placed, exercise.start, exercise.end
+                )
+                and day_counts[local_day] < max_blocks
+                and day_hours[local_day] + dur_h <= max_hours + 1e-9
+            )
         if fits_here:
-            placed.append(ex)
-            if is_weekday:
-                weekday_counts[local_day] += 1
+            placed.append(exercise)
+            day_counts[local_day] += 1
+            day_hours[local_day] += dur_h
             continue
 
-        # Reschedule into a free slot; prefer weekends for overflow.
         new_slot = None
-        for day in _candidate_exercise_days(week_start, week_end, tz, now):
-            if (
-                day.weekday() < 5
-                and weekday_counts[day] >= settings.max_exercise_blocks_weekday
-            ):
+        for day in _candidate_exercise_days(
+            horizon_start, horizon_end, tz, now
+        ):
+            if day_counts[day] >= max_blocks:
                 continue
-            ds = datetime(day.year, day.month, day.day, earliest, 0, tzinfo=tz)
-            de = datetime(day.year, day.month, day.day, 22, 0, tzinfo=tz)
-            floor = max(ds, now) if day == _as_local(now, tz).date() else ds
-            preferred = max(floor, ds.replace(hour=max(earliest, 17)))
-            if day.weekday() >= 5:
-                preferred = max(floor, ds.replace(hour=max(earliest, 9)))
-            slot = find_non_overlapping_slot(
-                preferred, duration, placed, floor, de
+            if day_hours[day] + dur_h > max_hours + 1e-9:
+                continue
+            slot = _try_place_exercise(
+                day, dur_h, placed, now, activity, ex, tz
             )
-            if slot is None:
-                slot = find_non_overlapping_slot(
-                    floor, duration, placed, floor, de
-                )
             if slot is not None:
                 new_slot = (day, slot)
                 break
         if new_slot is None:
-            # Cannot place without overlap — drop from plan rather than violate.
             continue
         day, (start, end) = new_slot
-        moved = ex.model_copy(
-            update={"start": start, "end": end, "origin": Origin.USER, "conflict": False}
+        placed.append(
+            exercise.model_copy(
+                update={"start": start, "end": end, "conflict": False}
+            )
         )
-        placed.append(moved)
-        if day.weekday() < 5:
-            weekday_counts[day] += 1
+        day_counts[day] += 1
+        day_hours[day] += dur_h
 
     state.events = placed
     return state
 
 
-def place_auto_exercise(state: AppState, now: datetime) -> AppState:
-    """Fill toward weekly goal: weekends first, ≤1 block Mon–Fri, from 07:00."""
-    state = state.model_copy(deep=True)
-    state.events = [
-        e
-        for e in state.events
-        if not (e.type == EventType.EXERCISE and e.origin == Origin.AUTO)
-    ]
-    if not _action_enabled(state, "spread_exercise"):
-        return state
+def _activity_counts_in_week(
+    events: list[Event],
+    week_start: datetime,
+    week_end: datetime,
+) -> dict[Activity, int]:
+    counts: dict[Activity, int] = {
+        Activity.CYCLING: 0,
+        Activity.GYM: 0,
+    }
+    for e in events:
+        if e.type != EventType.EXERCISE or e.activity is None:
+            continue
+        if overlaps(e.start, e.end, week_start, week_end):
+            counts[e.activity] = counts.get(e.activity, 0) + 1
+    return counts
 
-    tz = _tz(state)
-    settings = state.settings
-    earliest = max(0, min(23, settings.exercise_earliest_hour))
-    week_start, week_end = week_bounds(now, tz)
-    summary = compute_week_summary(state, now)
-    remaining = summary.remaining_hours
-    walking_week = sum(
-        hours_between(e.start, e.end)
-        for e in state.events
-        if e.type == EventType.EXERCISE
-        and e.activity == Activity.WALKING
-        and overlaps(e.start, e.end, week_start, week_end)
+
+def _diverse_activity_order(
+    counts: dict[Activity, int],
+    local_day: date,
+) -> list[Activity]:
+    """Least-used activities first so the week rotates gym/cycling."""
+    candidates = [Activity.GYM, Activity.CYCLING]
+
+    # Rotate tie-break by day so the same activity is not always second pick.
+    rotation = [Activity.CYCLING, Activity.GYM]
+    offset = local_day.toordinal() % len(rotation)
+    rotated = rotation[offset:] + rotation[:offset]
+    rank = {a: i for i, a in enumerate(rotated)}
+
+    def sort_key(activity: Activity) -> tuple[int, int, int]:
+        # On weekends, prefer cycling so gym does not consume open days.
+        weekend_penalty = (
+            1 if local_day.weekday() >= 5 and activity == Activity.GYM else 0
+        )
+        return (counts.get(activity, 0), weekend_penalty, rank.get(activity, 99))
+
+    return sorted(candidates, key=sort_key)
+
+
+def _day_has_exercise_room(
+    events: list[Event],
+    local_day: date,
+    tz: ZoneInfo | timezone,
+    session_min: float,
+    max_blocks: int,
+    max_hours: float,
+) -> bool:
+    if _exercise_count_on_date(events, local_day, tz) >= max_blocks:
+        return False
+    room = max_hours - _exercise_hours_on_date(events, local_day, tz)
+    return room >= session_min - 1e-9
+
+
+def _target_session_hours(
+    remaining: float,
+    room: float,
+    session_min: float,
+    session_max: float,
+    open_days: int,
+) -> float:
+    """Size a session so remaining hours can still cover open days."""
+    if open_days <= 0:
+        return min(session_max, room, remaining)
+    even = remaining / open_days
+    duration = min(session_max, room, max(session_min, even))
+    if remaining - duration < session_min - 1e-9 and remaining <= room + 1e-9:
+        # Last chunk: take what's left if it still fits session bounds.
+        if remaining >= session_min - 1e-9:
+            duration = min(session_max, room, remaining)
+    return duration
+
+
+def _place_one_exercise_session(
+    state: AppState,
+    local_day: date,
+    duration: float,
+    now: datetime,
+    ex: dict[str, Any],
+    tz: ZoneInfo | timezone,
+    session_min: float,
+    activity_counts: dict[Activity, int],
+) -> tuple[float, Activity] | None:
+    """Try to place one Auto session; return (hours, activity) or None."""
+    room = (
+        _f(ex, "max_exercise_hours_per_day", 3.0)
+        - _exercise_hours_on_date(state.events, local_day, tz)
     )
+    if duration > room + 1e-9:
+        duration = room
+    if duration < session_min - 1e-9:
+        return None
 
-    for local_day in _candidate_exercise_days(week_start, week_end, tz, now):
-        if remaining <= 1e-6:
-            break
-        is_weekday = local_day.weekday() < 5
-        if is_weekday and _exercise_count_on_date(
-            state.events, local_day, tz
-        ) >= settings.max_exercise_blocks_weekday:
-            continue
-
-        ds = datetime(
-            local_day.year, local_day.month, local_day.day, earliest, 0, tzinfo=tz
+    for act in _diverse_activity_order(activity_counts, local_day):
+        slot = _try_place_exercise(
+            local_day, duration, state.events, now, act, ex, tz
         )
-        de = datetime(local_day.year, local_day.month, local_day.day, 22, 0, tzinfo=tz)
-        if de <= now:
-            continue
-        floor = max(ds, now)
-        duration = min(
-            settings.session_max_hours,
-            max(settings.session_min_hours, remaining)
-            if remaining >= settings.session_min_hours
-            else settings.session_min_hours,
-        )
-        preferred = floor
-        if local_day.weekday() >= 5:
-            preferred = max(floor, ds.replace(hour=max(earliest, 9)))
-        else:
-            preferred = max(floor, ds.replace(hour=max(earliest, 17)))
-        slot = find_non_overlapping_slot(
-            preferred,
-            timedelta(hours=duration),
-            state.events,
-            floor,
-            de,
-        )
-        if slot is None and duration > settings.session_min_hours:
-            duration = settings.session_min_hours
-            slot = find_non_overlapping_slot(
-                preferred,
-                timedelta(hours=duration),
-                state.events,
-                floor,
-                de,
-            )
+        placed_dur = duration
+        if slot is None and duration > session_min + 1e-9:
+            shorter = min(session_min, room)
+            if shorter >= session_min - 1e-9:
+                slot = _try_place_exercise(
+                    local_day, shorter, state.events, now, act, ex, tz
+                )
+                if slot is not None:
+                    placed_dur = shorter
         if slot is None:
             continue
         w_start, slot_end = slot
-        activity = Activity.CYCLING
-        if (
-            settings.walking_max_hours is not None
-            and walking_week + duration > settings.walking_max_hours
-        ):
-            activity = Activity.GYM
         state.events.append(
             Event(
-                title=activity.value.title(),
+                title=act.value.title(),
                 type=EventType.EXERCISE,
                 start=w_start,
                 end=slot_end,
                 origin=Origin.AUTO,
-                activity=activity,
+                activity=act,
             )
         )
-        remaining = max(0.0, remaining - duration)
-        if activity == Activity.WALKING:
-            walking_week += duration
+        return placed_dur, act
+    return None
+
+
+def place_auto_exercise(
+    state: AppState, now: datetime, through: date | None = None
+) -> AppState:
+    """Fill toward each week's goal across the planning horizon.
+
+    Spreads sessions over remaining days, rotates activities, and prefers
+    meeting ``weekend_min_hours`` on Sat+Sun before packing weekdays.
+    """
+    state = state.model_copy(deep=True)
+    tz = _tz(state)
+    horizon_start, horizon_end = planning_horizon(now, tz, through=through)
+    state.events = [
+        e
+        for e in state.events
+        if not (
+            e.type == EventType.EXERCISE
+            and e.origin == Origin.AUTO
+            and e.start < horizon_end
+            and e.end > horizon_start
+        )
+    ]
+    if not rule_enabled(state, RuleKey.WEEKLY_EXERCISE_GOAL):
+        return state
+
+    ex = rule_params(state, RuleKey.WEEKLY_EXERCISE_GOAL)
+    session_min = _f(ex, "session_min_hours", 1.0)
+    session_max = _f(ex, "session_max_hours", 3.0)
+    max_blocks = _i(ex, "max_exercise_blocks_per_day", 1)
+    max_hours = _f(ex, "max_exercise_hours_per_day", 3.0)
+    weekend_min = _f(ex, "weekend_min_hours", 4.0)
+
+    for week_start, week_end in iter_planning_weeks(now, tz, through=through):
+        summary = compute_week_summary(state, now, week_start, week_end)
+        remaining = summary.remaining_hours
+        activity_counts = _activity_counts_in_week(
+            state.events, week_start, week_end
+        )
+        candidates = _candidate_exercise_days(
+            week_start, week_end, tz, now
+        )
+        weekend_days = [d for d in candidates if d.weekday() >= 5]
+        weekend_hours = sum(
+            _exercise_hours_on_date(state.events, d, tz) for d in weekend_days
+        )
+
+        def _open_days(pool: list[date]) -> list[date]:
+            return [
+                d
+                for d in pool
+                if _day_has_exercise_room(
+                    state.events,
+                    d,
+                    tz,
+                    session_min,
+                    max_blocks,
+                    max_hours,
+                )
+            ]
+
+        def _place_on_day(
+            local_day: date, want: float, *, open_pool: list[date] | None = None
+        ) -> bool:
+            nonlocal remaining, weekend_hours
+            if remaining < session_min - 1e-9:
+                return False
+            if not _day_has_exercise_room(
+                state.events,
+                local_day,
+                tz,
+                session_min,
+                max_blocks,
+                max_hours,
+            ):
+                return False
+            hours_today = _exercise_hours_on_date(
+                state.events, local_day, tz
+            )
+            room = max_hours - hours_today
+            pool = open_pool if open_pool is not None else candidates
+            open_n = len(_open_days(pool))
+            duration = _target_session_hours(
+                min(want, remaining),
+                room,
+                session_min,
+                session_max,
+                max(1, open_n),
+            )
+            placed = _place_one_exercise_session(
+                state,
+                local_day,
+                duration,
+                now,
+                ex,
+                tz,
+                session_min,
+                activity_counts,
+            )
+            if placed is None:
+                return False
+            placed_h, act = placed
+            remaining = max(0.0, remaining - placed_h)
+            activity_counts[act] = activity_counts.get(act, 0) + 1
+            if local_day.weekday() >= 5:
+                weekend_hours += placed_h
+            return True
+
+        # Phase 1: prioritize weekend toward weekend_min_hours.
+        weekend_need = max(0.0, weekend_min - weekend_hours)
+        while weekend_need >= session_min - 1e-9 and remaining >= session_min - 1e-9:
+            open_weekend = sorted(
+                _open_days(weekend_days),
+                key=lambda d: (
+                    _exercise_hours_on_date(state.events, d, tz),
+                    d.toordinal(),
+                ),
+            )
+            if not open_weekend:
+                break
+            before = weekend_hours
+            if not _place_on_day(
+                open_weekend[0],
+                min(weekend_need, remaining),
+                open_pool=open_weekend,
+            ):
+                # Skip a day that cannot fit any activity window.
+                weekend_days = [
+                    d for d in weekend_days if d != open_weekend[0]
+                ]
+                continue
+            weekend_need = max(0.0, weekend_min - weekend_hours)
+            if weekend_hours <= before + 1e-9:
+                break
+
+        # Phase 2: spread remaining hours across all days (fewest hours first).
+        while remaining >= session_min - 1e-9:
+            open_all = sorted(
+                _open_days(candidates),
+                key=lambda d: (
+                    _exercise_count_on_date(state.events, d, tz),
+                    _exercise_hours_on_date(state.events, d, tz),
+                    d.toordinal(),
+                ),
+            )
+            if not open_all:
+                break
+            if not _place_on_day(open_all[0], remaining, open_pool=open_all):
+                candidates = [d for d in candidates if d != open_all[0]]
+                continue
 
     return state
 
 
-def recalculate(state: AppState, now: datetime | None = None) -> AppState:
-    """Run full recalculation; returns a new AppState."""
+def _study_hours_on_date(
+    events: list[Event], day: date, tz: ZoneInfo | timezone
+) -> float:
+    return sum(
+        hours_between(e.start, e.end)
+        for e in events
+        if e.type == EventType.PERSONAL
+        and e.title == ROUTINE_STUDY_TITLE
+        and _as_local(e.start, tz).date() == day
+    )
+
+
+def place_weekend_study(
+    state: AppState, now: datetime, through: date | None = None
+) -> AppState:
+    """Pack Auto study into Sat/Sun free time toward weekend_goal_hours.
+
+    Hours are not fixed clocks — any free slot between earliest and latest
+    is eligible. Runs after exercise so weekend exercise keeps priority.
+    """
+    if not rule_enabled(state, RuleKey.STUDY_SCHEDULE):
+        return state
+
+    state = state.model_copy(deep=True)
+    tz = _tz(state)
+    study = rule_params(state, RuleKey.STUDY_SCHEDULE)
+    goal = _f(study, "weekend_goal_hours", 14.0)
+    earliest = max(0, min(23, _i(study, "weekend_earliest_hour", 7)))
+    latest = max(earliest + 1, min(24, _i(study, "weekend_latest_hour", 22)))
+    block_min = _f(study, "weekend_block_min_hours", 2.0)
+    block_max = _f(study, "weekend_block_max_hours", 4.0)
+    today = _as_local(now, tz).date()
+
+    for week_start, week_end in iter_planning_weeks(now, tz, through=through):
+        monday = _as_local(week_start, tz).date()
+        weekend_days = [
+            d
+            for d in (monday + timedelta(days=5), monday + timedelta(days=6))
+            if d >= today and d < _as_local(week_end, tz).date()
+        ]
+        weekend_days = [
+            d
+            for d in weekend_days
+            if not _user_study_on_day(state.events, d, tz)
+        ]
+        if not weekend_days:
+            continue
+
+        placed_hours = sum(
+            _study_hours_on_date(state.events, d, tz) for d in weekend_days
+        )
+        remaining = max(0.0, goal - placed_hours)
+
+        while remaining >= block_min - 1e-9:
+            day = min(
+                weekend_days,
+                key=lambda d: (
+                    _study_hours_on_date(state.events, d, tz),
+                    d.toordinal(),
+                ),
+            )
+            day_start = datetime(
+                day.year, day.month, day.day, earliest, 0, tzinfo=tz
+            )
+            day_end = datetime(
+                day.year, day.month, day.day, latest, 0, tzinfo=tz
+            )
+            if day == today:
+                day_start = max(day_start, now)
+            if day_start >= day_end:
+                weekend_days = [d for d in weekend_days if d != day]
+                if not weekend_days:
+                    break
+                continue
+
+            open_n = len(weekend_days)
+            even = remaining / max(1, open_n)
+            target = min(block_max, remaining, max(block_min, even))
+            if (
+                remaining - target < block_min - 1e-9
+                and remaining <= block_max + 1e-9
+            ):
+                target = min(block_max, remaining)
+
+            windows = free_windows_for_day(
+                day_start, day_end, state.events, block_min
+            )
+            if not windows:
+                weekend_days = [d for d in weekend_days if d != day]
+                if not weekend_days:
+                    break
+                continue
+
+            # Pack the largest free window so study stays in fewer long blocks.
+            w_start, w_end = max(
+                windows, key=lambda w: hours_between(w[0], w[1])
+            )
+            fit = min(target, hours_between(w_start, w_end))
+            if fit < block_min - 1e-9:
+                weekend_days = [d for d in weekend_days if d != day]
+                if not weekend_days:
+                    break
+                continue
+            # Absorb leftover into this block when it would not form another.
+            leftover = remaining - fit
+            if (
+                leftover < block_min - 1e-9
+                and remaining <= hours_between(w_start, w_end) + 1e-9
+                and remaining <= block_max + 1e-9
+            ):
+                fit = remaining
+
+            slot = (w_start, w_start + timedelta(hours=fit))
+            duration_h = fit
+
+            s, e = slot
+            state.events.append(
+                Event(
+                    title=ROUTINE_STUDY_TITLE,
+                    type=EventType.PERSONAL,
+                    start=s,
+                    end=e,
+                    origin=Origin.AUTO,
+                )
+            )
+            remaining = max(0.0, remaining - duration_h)
+
+    return state
+
+
+def recompute_shopping(
+    state: AppState, now: datetime
+) -> tuple[list[ShoppingLine], list[Event]]:
+    """Build shopping list and Auto store-trip events inside store hours."""
+    tz = _tz(state)
+    today = _as_local(now, tz).date()
+    shop = rule_params(state, RuleKey.BATCH_SHOPPING)
+    recipes = {r.id: r for r in state.recipes}
+    inv_by_name = {i.name.lower(): i for i in state.fridge}
+
+    meal_uses: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    demand_unit: dict[str, Unit] = {}
+    display_name: dict[str, str] = {}
+
+    for e in sorted(
+        [ev for ev in state.events if ev.type == EventType.MEAL],
+        key=lambda x: x.start,
+    ):
+        recipe = recipes.get(e.recipe_id or "")
+        if not recipe:
+            continue
+        meal_day = _as_local(e.start, tz).date()
+        for line in recipe.ingredients:
+            key = line.name.lower()
+            qty = line.quantity * e.portions
+            meal_uses[key].append((meal_day, qty))
+            demand_unit[key] = line.unit
+            display_name[key] = line.name
+
+    lead = max(0, _i(shop, "shopping_lead_days", 1))
+    batch_days = max(1, _i(shop, "shopping_batch_days", 4))
+    batch_on = rule_enabled(state, RuleKey.BATCH_SHOPPING)
+
+    pending: list[tuple[date, str, float, Unit]] = []
+    for key, uses in meal_uses.items():
+        item = inv_by_name.get(key)
+        available = available_qty(item, today) if item else 0.0
+        expiration = item.expiration_date if item else None
+        uncovered = _consume_stock_for_uses(uses, available, expiration)
+        if not uncovered:
+            continue
+        name = display_name[key]
+        unit = demand_unit.get(key, Unit.G)
+        for day, qty in uncovered:
+            need_day = day if day >= today else today
+            pending.append((need_day, name, qty, unit))
+
+    kept_events = [
+        e
+        for e in state.events
+        if not (e.type == EventType.SHOPPING and e.origin == Origin.AUTO)
+    ]
+    if not batch_on:
+        # No store-trip events — merged shortfall list (no trip_date).
+        merged_flat: dict[str, tuple[float, Unit]] = {}
+        order_flat: list[str] = []
+        for _need, name, qty, unit in sorted(
+            pending, key=lambda row: (row[0], row[1].lower())
+        ):
+            if name not in merged_flat:
+                order_flat.append(name)
+                merged_flat[name] = (qty, unit)
+            else:
+                prev_qty, prev_unit = merged_flat[name]
+                merged_flat[name] = (prev_qty + qty, prev_unit)
+        flat = [
+            ShoppingLine(
+                ingredient=name,
+                quantity=merged_flat[name][0],
+                unit=merged_flat[name][1],
+            )
+            for name in order_flat
+        ]
+        return flat, kept_events
+
+    shop_duration = timedelta(
+        minutes=max(15, _i(shop, "shopping_duration_min", 45))
+    )
+    open_h = max(0, min(23, _i(shop, "store_open_hour", 9)))
+    close_h = max(open_h + 1, min(24, _i(shop, "store_close_hour", 19)))
+
+    def _user_shopping_covering(trip_day: date) -> Event | None:
+        """User store trip on trip_day or within the batch window."""
+        best: Event | None = None
+        best_delta: int | None = None
+        for e in kept_events:
+            if e.type != EventType.SHOPPING or e.origin == Origin.AUTO:
+                continue
+            ed = _as_local(e.start, tz).date()
+            delta = (ed - trip_day).days
+            if delta < 0 or delta >= batch_days:
+                continue
+            if best_delta is None or delta < best_delta:
+                best = e
+                best_delta = delta
+        return best
+
+    def _find_auto_slot(day: date) -> tuple[datetime, datetime] | None:
+        preferred_hour = min(
+            close_h - 1, max(open_h, 10 if day.weekday() >= 5 else 17)
+        )
+        preferred = datetime(
+            day.year, day.month, day.day, preferred_hour, 0, tzinfo=tz
+        )
+        search_start = datetime(
+            day.year, day.month, day.day, open_h, 0, tzinfo=tz
+        )
+        search_end = datetime(
+            day.year, day.month, day.day, close_h, 0, tzinfo=tz
+        )
+        slot = find_non_overlapping_slot(
+            preferred, shop_duration, kept_events, search_start, search_end
+        )
+        if slot is not None:
+            return slot
+        for offset in range(1, 8):
+            alt = day + timedelta(days=offset)
+            preferred = datetime(
+                alt.year,
+                alt.month,
+                alt.day,
+                min(
+                    close_h - 1,
+                    max(open_h, 10 if alt.weekday() >= 5 else 17),
+                ),
+                0,
+                tzinfo=tz,
+            )
+            search_start = datetime(
+                alt.year, alt.month, alt.day, open_h, 0, tzinfo=tz
+            )
+            search_end = datetime(
+                alt.year, alt.month, alt.day, close_h, 0, tzinfo=tz
+            )
+            slot = find_non_overlapping_slot(
+                preferred,
+                shop_duration,
+                kept_events,
+                search_start,
+                search_end,
+            )
+            if slot is not None:
+                return slot
+        return None
+
+    def _rows_for_trip(
+        rows: list[tuple[date, str, float, Unit]], trip_day: date
+    ) -> tuple[
+        list[tuple[date, str, float, Unit]],
+        list[tuple[date, str, float, Unit]],
+    ]:
+        """Split rows into covered by trip_day vs leftover (batch + shelf)."""
+        cover_until = trip_day + timedelta(days=batch_days)
+        covered: list[tuple[date, str, float, Unit]] = []
+        leftover: list[tuple[date, str, float, Unit]] = []
+        for row in rows:
+            need_day, name, qty, unit = row
+            if need_day >= cover_until:
+                leftover.append(row)
+                continue
+            item = inv_by_name.get(name.lower())
+            shelf = item.shelf_life_days if item else None
+            if shelf is not None and need_day > trip_day + timedelta(days=shelf):
+                leftover.append(row)
+                continue
+            covered.append(row)
+        return covered, leftover
+
+    def _merge_trip_items(
+        covered: list[tuple[date, str, float, Unit]],
+    ) -> list[tuple[str, float, Unit]]:
+        merged: dict[str, tuple[float, Unit]] = {}
+        order: list[str] = []
+        for _need, name, qty, unit in covered:
+            if name not in merged:
+                order.append(name)
+                merged[name] = (qty, unit)
+            else:
+                prev_qty, prev_unit = merged[name]
+                merged[name] = (prev_qty + qty, prev_unit)
+        items: list[tuple[str, float, Unit]] = []
+        for name in order:
+            qty, unit = merged[name]
+            item = inv_by_name.get(name.lower())
+            shelf = item.shelf_life_days if item else None
+            if shelf is None:
+                minimum = item.minimum_quantity if item else 0.0
+                replenish = item.replenishment_quantity if item else 0.0
+                qty = purchase_quantity(qty, 0.0, minimum, replenish)
+            items.append((name, qty, unit))
+        return items
+
+    trip_lines: list[ShoppingLine] = []
+    remaining = sorted(pending, key=lambda row: (row[0], row[1].lower()))
+    # Guard against a stuck row that can never be placed.
+    stalled = 0
+    while remaining and stalled < len(remaining) + 5:
+        first_need = remaining[0][0]
+        ideal_trip = first_need - timedelta(days=lead)
+        if ideal_trip < today:
+            ideal_trip = today
+
+        user_trip = _user_shopping_covering(ideal_trip)
+        if user_trip is not None:
+            trip_date = _as_local(user_trip.start, tz).date()
+            covered, leftover = _rows_for_trip(remaining, trip_date)
+            if not covered:
+                # User trip too early/late for this need — try Auto instead.
+                user_trip = None
+            else:
+                items = _merge_trip_items(covered)
+                for name, qty, unit in items:
+                    trip_lines.append(
+                        ShoppingLine(
+                            ingredient=name,
+                            quantity=qty,
+                            unit=unit,
+                            trip_date=trip_date,
+                        )
+                    )
+                remaining = leftover
+                stalled = 0
+                continue
+
+        slot = _find_auto_slot(ideal_trip)
+        if slot is None:
+            stalled += 1
+            # Rotate the blocking row to the end so others can place.
+            remaining = remaining[1:] + remaining[:1]
+            continue
+        start, end = slot
+        trip_date = _as_local(start, tz).date()
+        covered, leftover = _rows_for_trip(remaining, trip_date)
+        if not covered:
+            stalled += 1
+            remaining = remaining[1:] + remaining[:1]
+            continue
+        items = _merge_trip_items(covered)
+        parts = [f"{n} {q:g}{u.value}" for n, q, u in items]
+        title = "Shopping — " + ", ".join(parts)
+        if len(title) > 80:
+            title = f"Shopping — {len(items)} items"
+        kept_events.append(
+            Event(
+                id=new_id(),
+                title=title,
+                type=EventType.SHOPPING,
+                start=start,
+                end=end,
+                all_day=False,
+                origin=Origin.AUTO,
+                ingredient_name=items[0][0] if len(items) == 1 else None,
+            )
+        )
+        for name, qty, unit in items:
+            trip_lines.append(
+                ShoppingLine(
+                    ingredient=name,
+                    quantity=qty,
+                    unit=unit,
+                    trip_date=trip_date,
+                )
+            )
+        remaining = leftover
+        stalled = 0
+
+    return trip_lines, kept_events
+
+
+def recalculate(
+    state: AppState,
+    now: datetime | None = None,
+    through: date | None = None,
+) -> AppState:
+    """Replan Auto events for the week of ``through`` (or today) + preload.
+
+    Auto events outside that window are left as already persisted. Past
+    weeks before the current Monday are not rewritten. Conflict flags are
+    left unchanged here — callers mark conflicts on the events they return.
+    """
     now = now or datetime.now(timezone.utc)
     state = state.model_copy(deep=True)
+    state = ensure_fridge_shelf_lives(state)
     state.events = _dedupe_identical_events(state.events)
-    state = apply_work_and_meals(state, now)
-    state = repair_exercise_events(state, now)
-    state = place_auto_exercise(state, now)
-    events = mark_conflicts(state.events)
-    interim = state.model_copy(deep=True)
-    interim.events = events
+    state = apply_work_and_meals(state, now, through)
+    state = repair_exercise_events(state, now, through)
+    state = place_auto_exercise(state, now, through)
 
-    shopping, events_with_reminders, stock_warnings = recompute_shopping_and_reminders(
-        interim, now
+    shopping, events_after_shopping = recompute_shopping(state, now)
+    state.events = events_after_shopping
+    horizon_start, horizon_end = planning_horizon(
+        now, _tz(state), through=through
     )
-    interim.events = mark_conflicts(events_with_reminders)
-    # After shopping placement, repair any leftover timed overlaps once more.
-    interim.events = [
+    state.events = [
         e
-        for e in interim.events
-        if not (e.type == EventType.EXERCISE and e.origin == Origin.AUTO)
+        for e in state.events
+        if not (
+            e.type == EventType.EXERCISE
+            and e.origin == Origin.AUTO
+            and e.start < horizon_end
+            and e.end > horizon_start
+        )
     ]
-    interim = repair_exercise_events(interim, now)
-    interim = place_auto_exercise(interim, now)
-    interim.events = mark_conflicts(interim.events)
-    interim.shopping = shopping
+    state = repair_exercise_events(state, now, through)
+    state = place_auto_exercise(state, now, through)
+    state = place_weekend_study(state, now, through)
+    state.shopping = shopping
+    state.week_summary = compute_week_summary(state, now)
+    return state
 
-    summary = compute_week_summary(interim, now)
-    suggestions, warnings = evaluate_rules(interim, now, summary)
-    warnings = warnings + stock_warnings
 
-    interim.week_summary = summary
-    interim.suggestions = suggestions
-    interim.warnings = warnings
-    return interim
+def prune_stale_auto_ahead(
+    state: AppState,
+    now: datetime,
+    *,
+    keep_weeks: int = 2,
+) -> AppState:
+    """Drop Auto events far ahead of the current week.
+
+    Used to clear leftovers from eager multi-month planning. Lazily planned
+    weeks the user has already visited beyond ``keep_weeks`` are also
+    dropped and will be rebuilt on the next fetch of that week.
+    """
+    tz = _tz(state)
+    start, _ = week_bounds(now, tz)
+    end = start + timedelta(days=7 * max(1, keep_weeks))
+    state = state.model_copy(deep=True)
+    state.events = [
+        e
+        for e in state.events
+        if e.origin != Origin.AUTO or e.start < end
+    ]
+    return state
 
 
 def to_snapshot(state: AppState) -> PlanSnapshot:
@@ -1214,32 +1743,7 @@ def to_snapshot(state: AppState) -> PlanSnapshot:
         fridge=state.fridge,
         rules=state.rules,
         shopping=state.shopping,
-        settings=state.settings,
+        signals=signal_emit.emit_signals(state),
         week_summary=state.week_summary,
-        suggestions=state.suggestions,
-        warnings=state.warnings,
+        timezone=app_config.default_timezone,
     )
-
-
-def rebuild_auto_blocks(state: AppState, now: datetime | None = None) -> AppState:
-    """Remove auto exercise/routine events, then recalculate to refill them.
-
-    Args:
-        state: Current app state (copied before mutation).
-        now: Instant used for week bounds and scheduling; defaults to UTC now.
-
-    Returns:
-        State with auto blocks cleared and a fresh recalculation applied.
-        User-origin events are preserved.
-    """
-    now = now or datetime.now(timezone.utc)
-    state = state.model_copy(deep=True)
-    state.events = [
-        e
-        for e in state.events
-        if not (
-            (e.type == EventType.EXERCISE and e.origin == Origin.AUTO)
-            or _is_routine_event(e)
-        )
-    ]
-    return recalculate(state, now)

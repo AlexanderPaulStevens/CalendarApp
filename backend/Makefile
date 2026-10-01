@@ -2,7 +2,7 @@
 
 .DEFAULT_GOAL := help
 
-# Calendar dev tasks. Run from backend/, or from the repo root via the root Makefile.
+# Calendar dev tasks. Run from backend/.
 # API http://127.0.0.1:8000   UI http://127.0.0.1:5173
 
 help: ## Show this help message
@@ -21,7 +21,7 @@ test: ## Run backend tests
 	uv run pytest
 
 api: ## Start the API on :8000
-	uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+	uv run python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ui: ## Start the frontend on :5173
 	npm run dev --prefix ../frontend
@@ -37,7 +37,7 @@ up: ## Start the API (:8000) and the frontend (:5173)
 	@echo "API  http://127.0.0.1:8000"
 	@echo "UI   http://127.0.0.1:5173"
 	@trap 'kill 0' EXIT INT TERM; \
-		uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 & \
+		uv run python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 & \
 		npm run dev --prefix ../frontend & \
 		wait
 

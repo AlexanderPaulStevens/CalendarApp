@@ -1,0 +1,126 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Instrument Serif", Georgia, serif;
+
+  /* Surface + type — quiet, slightly cool so pastels read first */
+  --color-ink: #2c322e;
+  --color-paper: #f5f2ec;
+  --color-line: #ddd7cc;
+  --color-surface: #fffcf7;
+
+  /* Chrome accent = exercise pastel family (shared with calendar chips) */
+  --color-moss: #2a4d3c;
+  --color-moss-soft: #d5e8dc;
+  --color-moss-edge: #9fc4ad;
+
+  /* Now-line / soft accents — blush, not terracotta */
+  --color-clay: #c49088;
+  --color-warn: #9b4f4a;
+  --color-warn-soft: #f0d9d6;
+
+  /* Legacy aliases aligned to rule pastels */
+  --color-meal: #2f4f63;
+  --color-meal-soft: #d5e4ef;
+
+  /* Pastel Scheduling Rule accents */
+  --color-rule-exercise: #d5e8dc;
+  --color-rule-exercise-edge: #9fc4ad;
+  --color-rule-exercise-ink: #2a4d3c;
+  --color-rule-meals: #d5e4ef;
+  --color-rule-meals-edge: #9bb8cc;
+  --color-rule-meals-ink: #2f4f63;
+  --color-rule-work: #ebe3d6;
+  --color-rule-work-edge: #c4b59a;
+  --color-rule-work-ink: #4a4030;
+  --color-rule-study: #e2ddeb;
+  --color-rule-study-edge: #b5adcb;
+  --color-rule-study-ink: #433a5c;
+  --color-rule-shopping: #f0d9d6;
+  --color-rule-shopping-edge: #d4a8a2;
+  --color-rule-shopping-ink: #5c3430;
+
+  /* Signal markers (prep instants; may overlay Events) */
+  --color-signal: #6b5a3e;
+  --color-signal-soft: #efe6d4;
+  --color-signal-edge: #c4b089;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  background:
+    radial-gradient(ellipse 70% 45% at 8% -8%, #d5e8dc 0%, transparent 55%),
+    radial-gradient(ellipse 55% 40% at 96% 0%, #d5e4ef 0%, transparent 50%),
+    radial-gradient(ellipse 40% 30% at 70% 100%, #f0d9d6 0%, transparent 45%),
+    var(--color-paper);
+}
+
+/* Softer native controls to match pastel calendar chrome */
+input[type='datetime-local'],
+input[type='number'],
+input[type='text'],
+textarea,
+select {
+  font-family: inherit;
+  color: inherit;
+  border-radius: 0.5rem;
+}
+
+button {
+  font-family: inherit;
+}
+
+/* Shared pastel control recipes */
+@layer components {
+  .btn-primary {
+    border-radius: 0.625rem;
+    border: 1px solid var(--color-moss-edge);
+    background: var(--color-moss-soft);
+    padding: 0.4rem 0.9rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--color-moss);
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--color-moss-soft) 70%, var(--color-moss-edge));
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+  }
+
+  .btn-ghost {
+    border-radius: 0.625rem;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.875rem;
+    color: color-mix(in srgb, var(--color-ink) 60%, transparent);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .btn-ghost:hover {
+    background: color-mix(in srgb, var(--color-ink) 5%, transparent);
+    color: var(--color-ink);
+  }
+
+  .field {
+    width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-line);
+    background: var(--color-surface);
+    padding: 0.4rem 0.6rem;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .field:focus {
+    border-color: var(--color-moss-edge);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-moss-soft) 80%, transparent);
+  }
+}

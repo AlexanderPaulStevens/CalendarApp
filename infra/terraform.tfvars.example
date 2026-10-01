@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and adjust if needed.
+# Do not commit terraform.tfvars if it contains secrets.
+
+project_id = "calendarapp-510309"
+region     = "europe-west1"
+
+# After the first docker push, set:
+# image = "europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest"

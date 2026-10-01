@@ -8,31 +8,10 @@ from pathlib import Path
 from threading import Lock
 
 from app.config import settings
+from app.ingredients.shelf_life import ensure_fridge_shelf_lives
+from app.rules.access import ensure_catalog_rules
 from app.schemas.models import AppState
 from app.store.seed import build_seed_state
-
-# Rules introduced after initial seed; merge by action_key on load.
-_SCHEDULE_ACTION_KEYS = (
-    "place_daily_meals",
-    "place_work_blocks",
-    "spread_exercise",
-    "batch_shopping",
-    "resolve_overlap",
-)
-
-
-def _ensure_schedule_rules(state: AppState) -> AppState:
-    existing = {r.action_key for r in state.rules}
-    missing = [
-        r
-        for r in build_seed_state().rules
-        if r.action_key in _SCHEDULE_ACTION_KEYS and r.action_key not in existing
-    ]
-    if not missing:
-        return state
-    updated = state.model_copy(deep=True)
-    updated.rules.extend(missing)
-    return updated
 
 
 class JsonStore:
@@ -70,11 +49,9 @@ class JsonStore:
             return self._state
         if self._path.exists():
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-            # Older saves used "inventory"; accept either key.
-            if "fridge" not in raw and "inventory" in raw:
-                raw["fridge"] = raw.pop("inventory")
             self._state = AppState.model_validate(raw)
-            self._state = _ensure_schedule_rules(self._state)
+            self._state = ensure_catalog_rules(self._state)
+            self._state = ensure_fridge_shelf_lives(self._state)
         else:
             self._state = build_seed_state()
             self._write_unlocked(self._state)

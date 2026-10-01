@@ -7,8 +7,6 @@ param(
 $ErrorActionPreference = "Stop"
 $Backend = Split-Path -Parent $PSScriptRoot
 $Frontend = (Resolve-Path (Join-Path $Backend "..\frontend")).Path
-# Google Drive / non-NTFS breaks npm install; run Vite from a local NTFS copy.
-$LocalFrontend = Join-Path $env:LOCALAPPDATA "calendar-frontend-deps"
 
 function Resolve-Uv {
     $winget = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
@@ -76,30 +74,12 @@ function Resolve-Npm {
     throw "npm was not found. Install Node.js and run make up again."
 }
 
-function Sync-FrontendToLocal {
-    New-Item -ItemType Directory -Force -Path $LocalFrontend | Out-Null
-    Copy-Item (Join-Path $Frontend "package.json") $LocalFrontend -Force
-    Copy-Item (Join-Path $Frontend "vite.config.ts") $LocalFrontend -Force
-    Copy-Item (Join-Path $Frontend "index.html") $LocalFrontend -Force
-    Get-ChildItem (Join-Path $Frontend "tsconfig*.json") | ForEach-Object {
-        Copy-Item $_.FullName $LocalFrontend -Force
-    }
-    $localSrc = Join-Path $LocalFrontend "src"
-    if (Test-Path $localSrc) {
-        Remove-Item $localSrc -Recurse -Force
-    }
-    Copy-Item (Join-Path $Frontend "src") $localSrc -Recurse -Force
-}
-
 function Stop-DevServers {
     $procs = Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -and (
             $_.CommandLine -match "uvicorn app.main:app" -or
-            ($_.CommandLine -match "vite" -and (
-                $_.CommandLine -match [regex]::Escape($Frontend) -or
-                $_.CommandLine -match [regex]::Escape($LocalFrontend) -or
-                $_.CommandLine -match "calendar-frontend-deps"
-            ))
+            ($_.CommandLine -match "vite" -and
+                $_.CommandLine -match [regex]::Escape($Frontend))
         )
     }
     foreach ($proc in $procs) {
@@ -118,14 +98,15 @@ if ($Action -eq "down") {
 
 Write-Host "API  http://127.0.0.1:8000"
 Write-Host "UI   http://127.0.0.1:5173"
-Write-Host "Syncing frontend to $LocalFrontend"
-Sync-FrontendToLocal
-
 Write-Host "Using $Uv"
 # Start uv.exe directly (not cmd /k): /k stays alive after uv fails, so Wait-Api
 # never sees HasExited and Vite can come up against a dead API.
+# Prefer `python -m uvicorn`: uv's uvicorn.exe trampoline fails to
+# canonicalize script paths on some Windows setups.
 $api = Start-Process -PassThru -FilePath $Uv -WorkingDirectory $Backend -WindowStyle Minimized -ArgumentList @(
     "run",
+    "python",
+    "-m",
     "uvicorn",
     "app.main:app",
     "--reload",
@@ -137,11 +118,11 @@ $api = Start-Process -PassThru -FilePath $Uv -WorkingDirectory $Backend -WindowS
 Wait-Api $api
 Write-Host "API ready"
 try {
-    if (-not (Test-Path (Join-Path $LocalFrontend "node_modules"))) {
+    if (-not (Test-Path (Join-Path $Frontend "node_modules"))) {
         Write-Host "Installing frontend dependencies..."
-        & $Npm install --prefix $LocalFrontend
+        & $Npm install --prefix $Frontend
     }
-    & $Npm run dev --prefix $LocalFrontend
+    & $Npm run dev --prefix $Frontend
     $code = $LASTEXITCODE
 }
 finally {

@@ -275,7 +275,3 @@ tmp/
 E2E*.txt
 output*.txt
 dev*.txt
-
-extra/
-
-frontend/

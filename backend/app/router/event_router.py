@@ -28,13 +28,3 @@ def delete_event(event_id: str) -> PlanSnapshot:
 def duplicate_event(event_id: str) -> PlanSnapshot:
     """Copy an event and return the updated plan snapshot."""
     return app_service.duplicate_event(event_id)
-
-
-@router.post("/{event_id}/complete", response_model=PlanSnapshot)
-def complete_event(event_id: str) -> PlanSnapshot:
-    """Mark an exercise done or a meal eaten.
-
-    Exercise: sets ``completed``. Meal: sets ``eaten`` and deducts recipe
-    ingredients × portions from the fridge. Other event types return 400.
-    """
-    return app_service.complete_event(event_id)
