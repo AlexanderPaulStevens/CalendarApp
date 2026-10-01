@@ -9,7 +9,7 @@ todos:
     content: JSON store, event schemas/CRUD, conflicts, day/week/month + grid UI
     status: completed
   - id: phase-2-exercise
-    content: PlanEngine exercise summary, feasibility, suggestions, replan, plan panel
+    content: PlanEngine exercise summary, feasibility, suggestions, rebuild auto blocks, plan panel
     status: completed
   - id: phase-3-meals-loop
     content: Recipes, inventory, shopping qty, eat/buy, run-out reminders
@@ -19,7 +19,7 @@ todos:
     status: completed
   - id: phase-5-chat-quickadd
     content: Meal library chat (structured output) + calendar + replace-on-conflict
-    status: pending
+    status: completed
 isProject: false
 ---
 
@@ -37,7 +37,7 @@ flowchart LR
   Engine[PlanEngine]
   LLM[OpenAI structured output]
 
-  UI -->|CRUD accept ignore replan| API
+  UI -->|CRUD accept ignore rebuild-auto-blocks| API
   UI -->|meal chat| API
   API --> Store
   API --> Engine
@@ -67,7 +67,7 @@ Core entities in `backend/app/schemas/` (and mirrored lightly on the frontend):
   - exercise: `activity`, `completed`
   - meal: `recipe_id`, `portions`, `eaten`
   - shopping reminder: `ingredient_name`
-- **Recipe** — ingredients `[{name, quantity, unit}]`, macros, prep time, cuisine, meal type, vegan, portion size, storage fields
+- **Recipe** — ingredients `[{name, quantity, unit}]`, macros, prep time, cuisine, meal type, portion size, storage fields (all meals are vegan; no vegan flag)
 - **InventoryItem** — name, quantity, unit, min, replenish, expiration, location
 - **Rule** — condition key, scope, action key, priority, strength (`mandatory` \| `advisory`), overridable, enabled, explanation template
 - **ShoppingLine** — ingredient, quantity, unit, checked (purchased)
@@ -128,7 +128,7 @@ On every mutation:
 6. Walk uneaten meals in time order → upsert/remove **auto** shopping-reminder events.
 7. Persist state; return `PlanSnapshot`.
 
-Manual edits set `origin=user`. Re-plan (`POST /api/plan/replan`) may replace `origin=auto` only; never moves user events.
+Manual edits set `origin=user`. Rebuild auto blocks (`POST /api/plan/rebuild-auto-blocks`) may replace `origin=auto` only; never moves user events.
 
 ### API (all under `/api`)
 
@@ -136,7 +136,7 @@ Manual edits set `origin=user`. Re-plan (`POST /api/plan/replan`) may replace `o
 | --- | --- | --- |
 | GET | `/health` | liveness (no secrets) |
 | GET | `/plan?from=&to=` | full snapshot for range |
-| POST | `/plan/replan` | fill free time with auto events |
+| POST | `/plan/rebuild-auto-blocks` | drop auto exercise/routine blocks and refill free time |
 | CRUD | `/events`, `/events/{id}` | create/update/delete/duplicate; body can include move/resize fields |
 | POST | `/events/{id}/complete` | mark exercise complete / meal eaten |
 | CRUD | `/recipes`, `/inventory`, `/rules` | catalog + settings rules |
@@ -185,13 +185,14 @@ On empty store, seed: default settings + starter rules from [`requirements.md`](
 
 Clean scaffold, calendar + conflicts, exercise planning, meals/inventory/shopping loop, starter rules. See [`README.md`](README.md).
 
-### Phase 5 — Meal library chat + quick-add replace
+### Phase 5 — Meal library chat + quick-add replace (done)
 
-- Recipes page as full meal-library overview with delete.
-- `POST /api/recipes/draft` — message → OpenAI structured output → recipe draft (not saved until confirm).
-- `POST /api/recipes` — save confirmed draft; chat UI: one box → draft card → save/discard.
-- Calendar **+** quick-add form; create path returns overlapping events; UI offers Replace (delete overlaps then create), Keep both, or Cancel.
-- Config: `openai_api_key` optional in settings; meal chat returns 503 if missing.
+- Recipes page as meal-library overview with delete.
+- `POST /api/recipes/draft` — message → OpenAI structured output → recipe draft.
+- Chat UI: one box → draft card → save/discard; `POST /api/recipes` saves.
+- Calendar **+** quick-add; overlap modal: Replace / Keep both / Cancel.
+- `EventCreate.replace_event_ids` deletes overlaps atomically on create.
+- Config: `OPENAI_API_KEY` / `OPENAI_MODEL` in `backend/.env`; meal chat returns 503 if key missing.
 
 ## Out of scope (per requirements “Later”)
 
