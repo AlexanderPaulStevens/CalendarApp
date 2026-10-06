@@ -130,6 +130,10 @@ def create_event(body: models.EventCreate) -> models.PlanSnapshot:
             for e in state.events:
                 if e.id in replace or e.all_day:
                     continue
+                # Daily meals stay on the calendar; User events may overlap
+                # them and are marked conflicting rather than displacing meals.
+                if e.type == models.EventType.MEAL:
+                    continue
                 if plan_engine.overlaps(e.start, e.end, event.start, event.end):
                     raise fastapi.HTTPException(
                         status_code=409,
@@ -190,6 +194,8 @@ def update_event(
             if not updated.all_day:
                 for other in state.events:
                     if other.id == event_id or other.all_day:
+                        continue
+                    if other.type == models.EventType.MEAL:
                         continue
                     if plan_engine.overlaps(
                         other.start, other.end, updated.start, updated.end

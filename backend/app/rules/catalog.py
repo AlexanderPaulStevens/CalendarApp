@@ -93,9 +93,11 @@ _CATALOG_META: dict[RuleKey, dict[str, str]] = {
     RuleKey.DAILY_MEALS: {
         "name": "Three meals a day",
         "explanation": (
-            "Place breakfast, lunch, and dinner Auto slots each day. After "
-            "exercise on the calendar, swap the next Auto meal's recipe "
-            "toward higher protein (or carbs+protein after cycling)."
+            "Place breakfast, lunch, and dinner Auto slots each day at their "
+            "preferred hours — never skip a meal when another Event overlaps; "
+            "conflicts are marked instead. After exercise on the calendar, "
+            "swap the next Auto meal's recipe toward higher protein (or "
+            "carbs+protein after cycling)."
         ),
     },
     RuleKey.WORK_SCHEDULE: {

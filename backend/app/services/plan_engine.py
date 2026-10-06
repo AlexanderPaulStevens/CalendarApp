@@ -507,7 +507,6 @@ def apply_work_and_meals(
     meals = rule_params(state, RuleKey.DAILY_MEALS)
     work = rule_params(state, RuleKey.WORK_SCHEDULE)
     study = rule_params(state, RuleKey.STUDY_SCHEDULE)
-    ex = rule_params(state, RuleKey.WEEKLY_EXERCISE_GOAL)
     state = state.model_copy(deep=True)
     state.events = [
         e
@@ -525,28 +524,11 @@ def apply_work_and_meals(
     if not place_work and not place_study and not place_meals:
         return state
 
-    earliest = max(0, min(23, _i(ex, "exercise_earliest_hour", 7)))
     threshold = _f(meals, "activity_threshold_hours", 2.0)
     day = horizon_start
     while day < horizon_end:
         local_date = _as_local(day, tz).date()
         weekday = local_date.weekday()
-        day_search_start = datetime(
-            local_date.year,
-            local_date.month,
-            local_date.day,
-            earliest,
-            0,
-            tzinfo=tz,
-        )
-        day_search_end = datetime(
-            local_date.year,
-            local_date.month,
-            local_date.day,
-            22,
-            0,
-            tzinfo=tz,
-        )
         lunch_start, lunch_end = _lunch_break_bounds(local_date, meals, tz)
 
         if place_work and not _user_work_on_day(state.events, local_date, tz):
@@ -701,16 +683,11 @@ def apply_work_and_meals(
                 recipe = next(
                     (r for r in state.recipes if r.id == recipe_id), None
                 )
-                slot = find_non_overlapping_slot(
-                    preferred,
-                    timedelta(minutes=duration_min),
-                    state.events,
-                    day_search_start,
-                    day_search_end,
-                )
-                if slot is None:
-                    continue
-                start, end = slot
+                # Meals are fixed daily anchors (like work/study hours): always
+                # place at the preferred clock time. Never skip when a User
+                # event blocks the day — overlaps are marked as conflicts.
+                start = preferred
+                end = preferred + timedelta(minutes=duration_min)
                 used_recipe_ids.add(recipe_id)
                 state.events.append(
                     Event(

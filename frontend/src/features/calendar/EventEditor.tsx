@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { CalendarEvent, EventType, Recipe } from '../../lib/types'
-import { parseIso } from '../../lib/dates'
+import { parseIso, sameDay } from '../../lib/dates'
 
 interface Props {
   event: CalendarEvent | null
@@ -52,13 +52,16 @@ function toLocalInput(d: Date): string {
 }
 
 function formatWhen(start: Date, end: Date): string {
-  const day = start.toLocaleDateString(undefined, {
+  const dayOpts: Intl.DateTimeFormatOptions = {
     weekday: 'short',
     month: 'short',
     day: 'numeric',
-  })
+  }
   const t = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  return `${day} · ${t(start)} – ${t(end)}`
+  if (sameDay(start, end)) {
+    return `${start.toLocaleDateString(undefined, dayOpts)} · ${t(start)} – ${t(end)}`
+  }
+  return `${start.toLocaleDateString(undefined, dayOpts)} ${t(start)} – ${end.toLocaleDateString(undefined, dayOpts)} ${t(end)}`
 }
 
 function RecipePreview({ recipe, portions }: { recipe: Recipe; portions: number }) {

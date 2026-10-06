@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import type { CalendarEvent, PlanSignal } from '../../lib/types'
 import { eventPastelClass } from '../../lib/ruleColors'
-import { addDays, parseIso, sameDay, startOfWeek } from '../../lib/dates'
+import { addDays, overlapsDay, parseIso, sameDay, segmentOnDay, startOfWeek } from '../../lib/dates'
 
 const HOUR_START = 7
 const HOUR_END = 22
@@ -51,6 +51,18 @@ function topFor(d: Date): number {
 function heightFor(start: Date, end: Date): number {
   const hours = Math.max((end.getTime() - start.getTime()) / 3600000, SNAP_MINUTES / 60)
   return Math.max(hours * PX_PER_HOUR, 18)
+}
+
+/** Clip a day-segment to the visible hour window; null if entirely outside. */
+function visibleSegment(segStart: Date, segEnd: Date, day: Date): { start: Date; end: Date } | null {
+  const visStart = new Date(day)
+  visStart.setHours(HOUR_START, 0, 0, 0)
+  const visEnd = new Date(day)
+  visEnd.setHours(HOUR_END, 0, 0, 0)
+  const start = new Date(Math.max(segStart.getTime(), visStart.getTime()))
+  const end = new Date(Math.min(segEnd.getTime(), visEnd.getTime()))
+  if (end.getTime() <= start.getTime()) return null
+  return { start, end }
 }
 
 function formatTime(d: Date): string {
@@ -186,7 +198,9 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
           All day
         </div>
         {days.map((day) => {
-          const allDay = events.filter((ev) => ev.all_day && sameDay(parseIso(ev.start), day))
+          const allDay = events.filter(
+            (ev) => ev.all_day && overlapsDay(parseIso(ev.start), parseIso(ev.end), day),
+          )
           const earlySignals = signals.filter((s) => {
             const at = parseIso(s.at)
             if (!sameDay(at, day)) return false
@@ -253,9 +267,14 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
           </div>
 
           {days.map((day) => {
-            const dayEvents = events.filter(
-              (ev) => !ev.all_day && sameDay(parseIso(ev.start), day),
-            )
+            const dayEvents = events.flatMap((ev) => {
+              if (ev.all_day) return []
+              const segment = segmentOnDay(parseIso(ev.start), parseIso(ev.end), day)
+              if (!segment) return []
+              const visible = visibleSegment(segment.start, segment.end, day)
+              if (!visible) return []
+              return [{ ev, start: visible.start, end: visible.end }]
+            })
             const daySignals = signals.filter((s) => {
               const at = parseIso(s.at)
               if (!sameDay(at, day)) return false
@@ -264,8 +283,11 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
             })
             const isToday = sameDay(day, today)
             const dayKey = day.toISOString()
-            const showDraft =
-              draft && sameDay(draft.start, day) && !dragRange
+            const draftSegment =
+              draft && !dragRange ? segmentOnDay(draft.start, draft.end, day) : null
+            const draftVisible = draftSegment
+              ? visibleSegment(draftSegment.start, draftSegment.end, day)
+              : null
             const showDragGhost = dragRange && sameDay(drag!.day, day)
 
             return (
@@ -333,12 +355,11 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
                   )
                 })}
 
-                {dayEvents.map((ev) => {
-                  const start = parseIso(ev.start)
-                  const end = parseIso(ev.end)
+                {dayEvents.map(({ ev, start, end }) => {
+                  const h = heightFor(start, end)
                   return (
                     <button
-                      key={ev.id}
+                      key={`${ev.id}-${dayKey}`}
                       type="button"
                       data-event
                       draggable
@@ -346,7 +367,7 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
                       className={`absolute left-1 right-1 z-20 overflow-hidden rounded-md px-1.5 py-1 text-left text-xs leading-tight shadow-sm transition-shadow hover:z-40 hover:shadow-md ${eventPastelClass(ev)}`}
                       style={{
                         top: topFor(start),
-                        height: heightFor(start, end),
+                        height: h,
                       }}
                       onClick={(e: ReactMouseEvent) => {
                         e.stopPropagation()
@@ -355,24 +376,24 @@ export function WeekView({ weekAnchor, events, signals = [], draft, onSelect, on
                       onPointerDown={(e) => e.stopPropagation()}
                     >
                       <div className="truncate font-medium">{ev.title}</div>
-                      {heightFor(start, end) > 28 && (
+                      {h > 28 && (
                         <div className="truncate opacity-75">{formatTime(start)}</div>
                       )}
                     </button>
                   )
                 })}
 
-                {showDraft && draft && (
+                {draftVisible && (
                   <div
                     className="pointer-events-none absolute left-1 right-1 z-10 overflow-hidden rounded-md border border-dashed border-[var(--color-moss-edge)] bg-[var(--color-moss-soft)]/75 px-1.5 py-1 text-xs text-[var(--color-moss)]"
                     style={{
-                      top: topFor(draft.start),
-                      height: heightFor(draft.start, draft.end),
+                      top: topFor(draftVisible.start),
+                      height: heightFor(draftVisible.start, draftVisible.end),
                     }}
                   >
                     <div className="font-medium">New event</div>
                     <div className="opacity-80">
-                      {formatTime(draft.start)} – {formatTime(draft.end)}
+                      {formatTime(draftVisible.start)} – {formatTime(draftVisible.end)}
                     </div>
                   </div>
                 )}
