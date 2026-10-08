@@ -10,6 +10,8 @@ locals {
   state_bucket_name = "${var.project_id}-calendar-state"
   ar_repo_id        = "calendar"
   image_path        = "${var.region}-docker.pkg.dev/${var.project_id}/${local.ar_repo_id}/app"
+  # Prefer digest so a new docker push is visible to Terraform (tag :latest alone is not).
+  resolved_image    = var.image_digest != "" ? "${local.image_path}@${var.image_digest}" : var.image
 }
 
 resource "google_project_service" "apis" {
@@ -99,7 +101,7 @@ resource "google_cloud_run_v2_service" "calendar" {
     }
 
     containers {
-      image = var.image
+      image = local.resolved_image
 
       ports {
         container_port = 8080

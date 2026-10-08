@@ -11,9 +11,20 @@ variable "region" {
 }
 
 variable "image" {
-  description = "Container image for Cloud Run (Artifact Registry). Use the hello placeholder until the first image is pushed."
+  description = "Full container image for Cloud Run. Used when image_digest is unset. Hello placeholder until the first real image is pushed."
   type        = string
   default     = "us-docker.pkg.dev/cloudrun/container/hello"
+}
+
+variable "image_digest" {
+  description = "Digest (sha256:...) of the Artifact Registry app image. When set, overrides var.image and forces a Cloud Run revision."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.image_digest == "" || startswith(var.image_digest, "sha256:")
+    error_message = "image_digest must be empty or start with sha256:."
+  }
 }
 
 variable "service_name" {

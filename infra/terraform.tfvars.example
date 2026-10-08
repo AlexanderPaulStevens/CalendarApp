@@ -4,5 +4,6 @@
 project_id = "calendarapp-510309"
 region     = "europe-west1"
 
-# After the first docker push, set:
-# image = "europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest"
+# After docker push, set the digest (tag :latest alone will not create a new
+# Cloud Run revision). Or pass -var="image_digest=sha256:...." on apply.
+# image_digest = "sha256:...."

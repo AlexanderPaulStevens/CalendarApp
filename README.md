@@ -71,29 +71,26 @@ printf '%s' 'sk-your-key' | gcloud secrets versions add openai-api-key --data-fi
 
 Until you do this, the secret value is the placeholder `not-set` and meal chat will not work.
 
-### 3. Build and push the app image
+### 3. Build, push, and deploy
 
-From the **repo root**:
+From the **repo root**. Pass the image **digest** to Terraform (not only `:latest`) so Cloud Run gets a new revision after each push.
 
 ```bash
 # bash / Git Bash
-IMAGE=europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest
-docker build -t "$IMAGE" .
-docker push "$IMAGE"
+IMAGE="$(terraform -chdir=infra output -raw artifact_registry_image)"
+docker build -t "$IMAGE:latest" .
+docker push "$IMAGE:latest"
+DIGEST="$(gcloud artifacts docker images describe "$IMAGE:latest" --format='get(image_summary.digest)')"
+terraform -chdir=infra apply -var="image_digest=$DIGEST"
 ```
 
 ```powershell
 # PowerShell
-$IMAGE = "europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest"
-docker build -t $IMAGE .
-docker push $IMAGE
-```
-
-### 4. Point Cloud Run at your image
-
-```bash
-cd infra
-terraform apply -var="image=europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest"
+$IMAGE = terraform -chdir=infra output -raw artifact_registry_image
+docker build -t "${IMAGE}:latest" .
+docker push "${IMAGE}:latest"
+$DIGEST = gcloud artifacts docker images describe "${IMAGE}:latest" --format='get(image_summary.digest)'
+terraform -chdir=infra apply -var="image_digest=$DIGEST"
 ```
 
 Or without Terraform:
@@ -101,10 +98,10 @@ Or without Terraform:
 ```bash
 gcloud run services update calendar \
   --region=europe-west1 \
-  --image=europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest
+  --image="$(terraform -chdir=infra output -raw artifact_registry_image):latest"
 ```
 
-Service URL: `terraform output -raw service_url`
+Service URL: `terraform -chdir=infra output -raw service_url`
 
 ### Useful outputs
 
