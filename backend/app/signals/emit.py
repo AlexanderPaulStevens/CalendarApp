@@ -10,11 +10,6 @@ from app.rules.access import rule_params
 from app.schemas import models
 from app.signals import catalog
 
-# Match plan_engine routine titles (avoid importing plan_engine — cycle).
-_WORK_TITLE = "Work"
-_STUDY_TITLE = "Study"
-
-
 def _recipe_by_id(state: models.AppState) -> dict[str, models.Recipe]:
     return {r.id: r for r in state.recipes}
 
@@ -56,11 +51,16 @@ def _is_trigger_host(event: models.Event) -> bool:
     """Work, study, or cooking (meal) — times when a Signal may fire."""
     if event.all_day:
         return False
-    if event.type == models.EventType.MEAL:
+    if event.type in (
+        models.EventType.MEAL,
+        models.EventType.WORK,
+        models.EventType.STUDY,
+    ):
         return True
+    # Legacy personal Work/Study titles before typed Events.
     if event.type == models.EventType.PERSONAL and event.title in (
-        _WORK_TITLE,
-        _STUDY_TITLE,
+        "Work",
+        "Study",
     ):
         return True
     return False

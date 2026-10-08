@@ -26,8 +26,9 @@ class EventType(str, Enum):
     EXERCISE = "exercise"
     MEAL = "meal"
     SHOPPING = "shopping"
+    WORK = "work"
+    STUDY = "study"
     PERSONAL = "personal"
-    REST = "rest"
 
 
 class Origin(str, Enum):
@@ -110,8 +111,10 @@ class WorkBlock(BaseModel):
 
 
 def default_work_blocks() -> list[WorkBlock]:
+    """Preferred work windows (~25h after lunch split; goal_hours caps at 24)."""
     return [
         WorkBlock(weekday=0, start_hour=9, end_hour=17),
+        WorkBlock(weekday=2, start_hour=9, end_hour=12),
         WorkBlock(weekday=2, start_hour=13, end_hour=17),
         WorkBlock(weekday=3, start_hour=9, end_hour=17),
         WorkBlock(weekday=4, start_hour=13, end_hour=17),

@@ -6,27 +6,30 @@ Default timezone: **Europe/Brussels**.
 
 ## Run locally
 
-```bash
-# terminal 1 — API
-cd backend
-cp .env.example .env   # set OPENAI_API_KEY for meal chat
-uv sync
-uv run python -m uvicorn app.main:app --reload --port 8000
+Start both the API and frontend from the **repo root** (Git Bash / WSL / macOS / Linux). Use `./` — do not `cd` into the script:
 
-# terminal 2 — frontend
-cd frontend
-npm install
-npm run dev
+```bash
+./dev.sh up
 ```
 
-- API: http://localhost:8000
-- UI: http://localhost:5173 (proxies `/api` to the backend)
+Stop them:
+
+```bash
+./dev.sh down
+```
+
+(`./backend/scripts/dev.sh` works the same.) The script starts the API on `:8000`, waits for health, installs frontend deps if needed, then runs Vite on `:5173`. Ctrl+C (or `down`) stops both.
+
+- **UI:** http://127.0.0.1:5173 (open this in the browser; proxies `/api` to the backend)
+- API: http://127.0.0.1:8000 — `GET /` redirects to the UI; docs at `/docs`
 
 Secrets belong in `backend/.env` (gitignored). State is stored in `backend/data/state.json` (seeded on first run). Delete that file to reset.
 
 ## Deploy to GCP (Cloud Run + Terraform)
 
 Project: `calendarapp-510309` · Region: `europe-west1` (Belgium).
+
+App URL: https://calendar-hafalcp6ka-ew.a.run.app
 
 One public Cloud Run service serves the API and the built SPA (same origin). App state is a JSON file on a GCS bucket mounted at `/data`.
 
@@ -73,9 +76,17 @@ Until you do this, the secret value is the placeholder `not-set` and meal chat w
 From the **repo root**:
 
 ```bash
+# bash / Git Bash
 IMAGE=europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
+```
+
+```powershell
+# PowerShell
+$IMAGE = "europe-west1-docker.pkg.dev/calendarapp-510309/calendar/app:latest"
+docker build -t $IMAGE .
+docker push $IMAGE
 ```
 
 ### 4. Point Cloud Run at your image

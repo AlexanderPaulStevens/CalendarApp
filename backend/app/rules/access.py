@@ -34,6 +34,7 @@ def rule_params(state: AppState, key: RuleKey) -> dict[str, Any]:
 def ensure_catalog_rules(state: AppState) -> AppState:
     """Merge missing catalog keys into state; drop unknown keys."""
     from app.rules.catalog import build_catalog_rules
+    from app.schemas.models import EventType
 
     by_key = {r.rule_key: r for r in state.rules}
     seed_by_key = {r.rule_key: r for r in build_catalog_rules()}
@@ -60,4 +61,19 @@ def ensure_catalog_rules(state: AppState) -> AppState:
             )
         )
     updated.rules = kept
+
+    # Legacy title-based Work/Study personal Events → typed Events.
+    migrated: list = []
+    changed = False
+    for event in updated.events:
+        if event.type == EventType.PERSONAL and event.title == "Work":
+            migrated.append(event.model_copy(update={"type": EventType.WORK}))
+            changed = True
+        elif event.type == EventType.PERSONAL and event.title == "Study":
+            migrated.append(event.model_copy(update={"type": EventType.STUDY}))
+            changed = True
+        else:
+            migrated.append(event)
+    if changed:
+        updated.events = migrated
     return updated

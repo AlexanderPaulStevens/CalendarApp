@@ -43,6 +43,8 @@ DEFAULT_PARAMETERS: dict[RuleKey, dict[str, Any]] = {
         "carbohydrate_target_g": None,
     },
     RuleKey.WORK_SCHEDULE: {
+        # Weekly hour target; User work counts, Auto fills the rest in work_blocks.
+        "goal_hours": 24.0,
         "work_blocks": [
             {
                 "weekday": b.weekday,
@@ -69,12 +71,7 @@ DEFAULT_PARAMETERS: dict[RuleKey, dict[str, Any]] = {
         "weekend_block_max_hours": 4.0,
     },
     RuleKey.BATCH_SHOPPING: {
-        # ~2 store trips per week when demand is continuous (7/2 ≈ 3.5).
-        "shopping_batch_days": 4,
-        "shopping_lead_days": 1,
         "shopping_duration_min": 45,
-        "store_open_hour": 9,
-        "store_close_hour": 19,
     },
 }
 
@@ -103,30 +100,33 @@ _CATALOG_META: dict[RuleKey, dict[str, str]] = {
     RuleKey.WORK_SCHEDULE: {
         "name": "Working hours",
         "explanation": (
-            "Place Auto work blocks for the configured weekdays and hours, "
-            "split around lunch so meals do not overlap."
+            "Keep work toward goal_hours each Plan week (default 24). User "
+            "work Events count first; Auto fills the remainder into "
+            "work_blocks, split around lunch. Extra User hours mean less "
+            "Auto work later in the week."
         ),
     },
     RuleKey.STUDY_SCHEDULE: {
         "name": "Study blocks",
         "explanation": (
-            "Place Auto study blocks on weekdays from study_blocks (default "
+            "Place Auto study Events on weekdays from study_blocks (default "
             "Tue 09:00–12:00 and 13:00–17:00, Wed 09:00–12:00, Fri "
-            "09:00–12:00). On weekends, pack free time between "
-            "weekend_earliest_hour and weekend_latest_hour toward at least "
-            "weekend_goal_hours (default 14)."
+            "09:00–12:00). A User study Event on a weekday claims that day. "
+            "On weekends, pack free time between weekend_earliest_hour and "
+            "weekend_latest_hour toward at least weekend_goal_hours "
+            "(default 14), counting User study hours."
         ),
     },
     RuleKey.BATCH_SHOPPING: {
         "name": "Batch shopping",
         "explanation": (
-            "If fridge stock cannot cover upcoming meals, place store-trip "
-            "Auto events lead days before run-out — about two trips per week "
-            "(batch_days of needs each), only in free time inside store open "
-            "hours. Perishables (shelf_life_days on the fridge item) are only "
-            "bought for meals they will still cover; pantry items may fill a "
-            "full batch. A User shopping event already on the calendar covers "
-            "that batch; Auto does not schedule a second trip for it."
+            "Always schedule two Farm Leuven trips each week: Wednesday as "
+            "late as possible before close (~18:00) and Saturday at open "
+            "(09:00). Hours are fixed (Mon–Sat 09:00–19:00, Sun 09:00–13:00). "
+            "User shopping events count toward the two; Auto fills the rest. "
+            "Shopping list lines are split across those trips by meal need "
+            "date and ingredient shelf life. Exercise keeps preferred slots "
+            "unless a trip cannot fit."
         ),
     },
 }

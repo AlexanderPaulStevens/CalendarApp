@@ -3,7 +3,7 @@ from datetime import date
 from fastapi import APIRouter, Query
 
 from app.schemas.models import PlanSnapshot
-from app.services import app_service
+from app.services import snapshot
 
 router = APIRouter(prefix="/plan", tags=["plan"])
 
@@ -19,4 +19,4 @@ def get_plan(
     ),
 ) -> PlanSnapshot:
     """Return the plan snapshot for the week containing anchor."""
-    return app_service.get_snapshot(anchor)
+    return snapshot.get_snapshot(anchor)

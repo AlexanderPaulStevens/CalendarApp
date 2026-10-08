@@ -33,8 +33,12 @@ A typed value that belongs on exactly one owning Rule (for example weekly hours 
 _Avoid_: AppSettings, settings, config knobs, shared settings bag
 
 **Placement constraint**:
-A Rule parameter that shapes how a Scheduling Rule may place Auto events (for example session min/max on `weekly_exercise_goal`, or store open hours on `batch_shopping`). It is not a Rule of its own. The engine applies it only when placing Auto events; User events are not checked against it. Free-time placement still obeys the non-overlap planner invariant, so Auto shopping never lands on work or exercise blocks already on the calendar.
+A Rule parameter that shapes how a Scheduling Rule may place Auto events (for example session min/max on `weekly_exercise_goal`, or trip duration on `batch_shopping`). It is not a Rule of its own. The engine applies it only when placing Auto events; User events are not checked against it. Free-time placement still obeys the non-overlap planner invariant. Farm Leuven open hours for shopping are fixed in code, not Rule parameters.
 _Avoid_: nested rule, soft setting, config knob, session_too_short / session_too_long / walking_over_cap (as catalog Rules)
+
+**Plan week**:
+The Mon–Sun local calendar week that `recalculate` rewrites for a given anchor date. Other weeks' Auto events stay as persisted until that week is fetched. There is no multi-week planning horizon or preload window.
+_Avoid_: planning horizon, preload weeks
 
 **rule_key**:
 The stable identity of a Rule type. One key maps to one evaluation and one enforcement behavior in the engine. The catalog of keys is closed: the API may create an instance of a known key (for example when a new Rule is introduced), but cannot invent unknown keys. At most one Rule instance per `rule_key` exists in state.
@@ -51,3 +55,11 @@ _Avoid_: overlap rule, resolve_overlap (as a user-facing Rule)
 **Shelf life**:
 How many days after purchase an ingredient stays usable (buy day through buy date plus those days). Stored on the fridge item; `null` means pantry or freezer with no buy-ahead limit. Shopping only assigns a perishable to a store trip when the meal falls inside that window.
 _Avoid_: expiration alone (as the buy-ahead policy), recipe leftover days (cooked `shelf_life_days` on a Recipe)
+
+**Work event**:
+An Event with type `work`. Hours count toward the `work_schedule` weekly goal; User work hours reduce how much Auto work the engine places that Plan week.
+_Avoid_: personal event titled Work, meeting-as-work without the work type
+
+**Study event**:
+An Event with type `study`. Weekday User study claims that day's Auto study; weekend User study hours count toward `weekend_goal_hours` packing.
+_Avoid_: personal event titled Study

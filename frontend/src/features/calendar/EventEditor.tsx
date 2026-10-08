@@ -12,7 +12,6 @@ interface Props {
   onClose: () => void
   onSave: (body: Record<string, unknown>) => void
   onDelete?: () => void
-  onDuplicate?: () => void
 }
 
 const TYPE_CHIPS: { type: EventType; label: string; pastel: string }[] = [
@@ -20,6 +19,18 @@ const TYPE_CHIPS: { type: EventType; label: string; pastel: string }[] = [
     type: 'personal',
     label: 'Event',
     pastel: 'bg-[var(--color-moss-soft)] text-[var(--color-ink)] border-[var(--color-line)]',
+  },
+  {
+    type: 'work',
+    label: 'Work',
+    pastel:
+      'bg-[var(--color-rule-work)] text-[var(--color-rule-work-ink)] border-[var(--color-rule-work-edge)]',
+  },
+  {
+    type: 'study',
+    label: 'Study',
+    pastel:
+      'bg-[var(--color-rule-study)] text-[var(--color-rule-study-ink)] border-[var(--color-rule-study-edge)]',
   },
   {
     type: 'exercise',
@@ -38,11 +49,6 @@ const TYPE_CHIPS: { type: EventType; label: string; pastel: string }[] = [
     label: 'Shop',
     pastel:
       'bg-[var(--color-rule-shopping)] text-[var(--color-rule-shopping-ink)] border-[var(--color-rule-shopping-edge)]',
-  },
-  {
-    type: 'rest',
-    label: 'Rest',
-    pastel: 'bg-[var(--color-rule-study)] text-[var(--color-rule-study-ink)] border-[var(--color-rule-study-edge)]',
   },
 ]
 
@@ -91,7 +97,6 @@ export function EventEditor({
   onClose,
   onSave,
   onDelete,
-  onDuplicate,
 }: Props) {
   const isNew = !event
   const initialStart = event ? parseIso(event.start) : (draftStart ?? new Date())
@@ -154,10 +159,18 @@ export function EventEditor({
   }
 
   function save() {
+    const defaultTitle =
+      type === 'work'
+        ? 'Work'
+        : type === 'study'
+          ? 'Study'
+          : type === 'personal'
+            ? 'Untitled'
+            : type
     const resolvedTitle =
       isMeal && selectedRecipe
         ? selectedRecipe.name
-        : title.trim() || (type === 'personal' ? 'Untitled' : type)
+        : title.trim() || defaultTitle
     const body: Record<string, unknown> = {
       title: resolvedTitle,
       type,
@@ -345,11 +358,6 @@ export function EventEditor({
         <button type="button" className="btn-ghost" onClick={onClose}>
           Cancel
         </button>
-        {onDuplicate && (
-          <button type="button" className="btn-ghost" onClick={onDuplicate}>
-            Duplicate
-          </button>
-        )}
         {onDelete && (
           <button
             type="button"

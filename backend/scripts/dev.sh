@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # Start or stop the API (:8000) and frontend (:5173).
-# Usage (from repo root or backend/):
-#   ./backend/scripts/dev.sh up
-#   ./backend/scripts/dev.sh down
+# Usage (from repo root):
+#   ./dev.sh up
+#   ./dev.sh down
 
 set -euo pipefail
+
+# Absolute Windows installs (Git Bash uses /c, WSL uses /mnt/c).
+if [[ -d /c/Users/u0138175 ]]; then
+  WIN_ROOT="/c"
+elif [[ -d /mnt/c/Users/u0138175 ]]; then
+  WIN_ROOT="/mnt/c"
+else
+  echo "Windows user dir not mounted" >&2
+  exit 1
+fi
+UV="$WIN_ROOT/Users/u0138175/.local/bin/uv.exe"
+NPM="$WIN_ROOT/Program Files/nodejs/npm.cmd"
 
 ACTION="${1:-}"
 if [[ "$ACTION" != "up" && "$ACTION" != "down" ]]; then
@@ -27,8 +39,14 @@ if [[ "$ACTION" == "down" ]]; then
   exit 0
 fi
 
-command -v uv >/dev/null || { echo "uv not found. Install: https://docs.astral.sh/uv/" >&2; exit 1; }
-command -v npm >/dev/null || { echo "npm not found. Install Node.js." >&2; exit 1; }
+if [[ ! -f "$UV" ]]; then
+  echo "uv not found at $UV" >&2
+  exit 1
+fi
+if [[ ! -f "$NPM" ]]; then
+  echo "npm not found at $NPM" >&2
+  exit 1
+fi
 
 echo "API  http://127.0.0.1:8000"
 echo "UI   http://127.0.0.1:5173"
@@ -40,11 +58,19 @@ trap cleanup EXIT INT TERM
 
 (
   cd "$BACKEND"
-  uv run python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+  "$UV" run python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ) &
 
+# Health-check via Windows Python so WSL curl cannot miss Windows localhost.
+api_ready() {
+  (
+    cd "$BACKEND"
+    "$UV" run python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=1)"
+  ) >/dev/null 2>&1
+}
+
 for _ in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:8000/api/health" >/dev/null 2>&1; then
+  if api_ready; then
     echo "API ready"
     break
   fi
@@ -53,7 +79,7 @@ done
 
 if [[ ! -d "$FRONTEND/node_modules" ]]; then
   echo "Installing frontend dependencies..."
-  npm install --prefix "$FRONTEND"
+  "$NPM" install --prefix "$FRONTEND"
 fi
 
-npm run dev --prefix "$FRONTEND"
+"$NPM" run dev --prefix "$FRONTEND"

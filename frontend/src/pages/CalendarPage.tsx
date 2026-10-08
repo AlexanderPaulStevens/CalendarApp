@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import * as api from '../lib/api'
 import type { CalendarEvent, PlanSnapshot } from '../lib/types'
@@ -14,6 +14,7 @@ import { FridgePanel } from '../features/panels/FridgePanel'
 import { MealsPanel } from '../features/panels/MealsPanel'
 import { RulesPanel } from '../features/panels/RulesPanel'
 import { ShoppingPanel } from '../features/panels/ShoppingPanel'
+import { PlanPanel } from '../features/plan-panel/PlanPanel'
 
 type Drawer = 'meals' | 'fridge' | 'shopping' | 'rules'
 
@@ -23,6 +24,61 @@ const DRAWER_TITLE: Record<Drawer, string> = {
   shopping: 'Shopping lists',
   rules: 'Rules',
 }
+
+const NAV: {
+  id: Drawer
+  label: string
+  icon: ReactNode
+}[] = [
+  {
+    id: 'meals',
+    label: 'Meals',
+    icon: (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.75">
+        <path d="M4 11h16M6 11V7a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v4M5 11v8h14v-8" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M9 15h6" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'fridge',
+    label: 'Fridge',
+    icon: (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.75">
+        <rect x="6" y="3" width="12" height="18" rx="2" />
+        <path d="M6 11h12M10 7v2M10 14v3" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'shopping',
+    label: 'Shopping',
+    icon: (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.75">
+        <path d="M6 7h15l-1.5 9h-12L6 7Z" strokeLinejoin="round" />
+        <path d="M6 7 5 3H3M9 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm9 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    id: 'rules',
+    label: 'Rules',
+    icon: (
+      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.75">
+        <path d="M12 4v4M12 16v4M4 12h4M16 12h4" strokeLinecap="round" />
+        <circle cx="12" cy="12" r="3.5" />
+      </svg>
+    ),
+  },
+]
+
+const LEGEND = [
+  { label: 'Exercise', cls: 'bg-[var(--color-rule-exercise)] border-[var(--color-rule-exercise-edge)]' },
+  { label: 'Meal', cls: 'bg-[var(--color-rule-meals)] border-[var(--color-rule-meals-edge)]' },
+  { label: 'Work', cls: 'bg-[var(--color-rule-work)] border-[var(--color-rule-work-edge)]' },
+  { label: 'Study', cls: 'bg-[var(--color-rule-study)] border-[var(--color-rule-study-edge)]' },
+  { label: 'Shop', cls: 'bg-[var(--color-rule-shopping)] border-[var(--color-rule-shopping-edge)]' },
+]
 
 export function CalendarPage() {
   const [params, setParams] = useSearchParams()
@@ -39,6 +95,8 @@ export function CalendarPage() {
     body: Record<string, unknown>
     overlapping: CalendarEvent[]
   } | null>(null)
+  const [railOpen, setRailOpen] = useState(true)
+  const [summaryOpen, setSummaryOpen] = useState(false)
   const qc = useQueryClient()
 
   const anchorDate = toDateParam(anchor)
@@ -67,6 +125,15 @@ export function CalendarPage() {
   const toBuy = plan?.shopping.length ?? 0
   const { toast, dismissToast } = useSignalNotifications(plan?.signals)
 
+  useEffect(() => {
+    if (!toast) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') dismissToast()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [toast, dismissToast])
+
   function setDrawer(next: Drawer | null) {
     if (next) setParams({ panel: next })
     else setParams({})
@@ -76,16 +143,6 @@ export function CalendarPage() {
     setSelected(null)
     setDraft(null)
     setEditorAnchor(null)
-  }
-
-  function openQuickAdd() {
-    const start = new Date()
-    start.setMinutes(0, 0, 0)
-    start.setHours(start.getHours() + 1)
-    const end = new Date(start.getTime() + 60 * 60 * 1000)
-    setSelected(null)
-    setEditorAnchor(null)
-    setDraft({ start, end })
   }
 
   function tryCreate(body: Record<string, unknown>) {
@@ -106,97 +163,153 @@ export function CalendarPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <header className="relative z-50 border-b border-[var(--color-line)]/80 bg-[var(--color-paper)]/80 px-4 py-3 backdrop-blur-md">
-        <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-4 gap-y-2.5">
+    <div className="flex h-full min-h-0">
+      {/* Left nav — week controls + tools */}
+      <aside className="relative z-30 flex w-[13.5rem] shrink-0 flex-col border-r border-[var(--color-line)]/90 bg-[var(--color-surface)]/80 backdrop-blur-md">
+        <div className="border-b border-[var(--color-line)]/80 px-4 pb-4 pt-5">
           <Link
             to="/"
-            className="font-[family-name:var(--font-display)] text-[1.65rem] leading-none tracking-tight text-[var(--color-ink)]"
+            className="font-[family-name:var(--font-display)] text-[1.85rem] leading-none tracking-tight text-[var(--color-ink)]"
           >
             Planner
           </Link>
+        </div>
 
-          <button
-            type="button"
-            onClick={openQuickAdd}
-            className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-moss-edge)] bg-[var(--color-moss-soft)] px-3.5 py-1.5 text-sm font-medium text-[var(--color-moss)] transition hover:brightness-[0.97]"
-            title="Create event"
-          >
-            <span className="text-base leading-none" aria-hidden>
-              +
-            </span>
-            Create
-          </button>
-
-          <div className="flex items-center gap-0.5 rounded-full border border-[var(--color-line)] bg-[var(--color-surface)]/70 p-0.5">
+        <div className="border-b border-[var(--color-line)]/80 px-3 py-3">
+          <div className="flex items-center justify-between gap-1">
             <button
               type="button"
-              className="rounded-full px-3 py-1.5 text-sm text-[var(--color-ink)]/75 transition hover:bg-[var(--color-moss-soft)]/60 hover:text-[var(--color-moss)]"
-              title="Jump to this week"
-              onClick={() => setAnchor(new Date())}
-            >
-              Today
-            </button>
-            <button
-              type="button"
-              className="rounded-full px-2.5 py-1.5 text-sm text-[var(--color-ink)]/55 transition hover:bg-black/[0.04] hover:text-[var(--color-ink)]"
+              className="btn-ghost px-2 py-1 text-sm"
               aria-label="Previous week"
               onClick={() => setAnchor((a) => addDays(a, -7))}
             >
               ←
             </button>
-            <span className="min-w-[9.5rem] px-1 text-center text-sm font-medium tabular-nums text-[var(--color-ink)]">
-              {weekLabel(anchor)}
-            </span>
             <button
               type="button"
-              className="rounded-full px-2.5 py-1.5 text-sm text-[var(--color-ink)]/55 transition hover:bg-black/[0.04] hover:text-[var(--color-ink)]"
+              className="min-w-0 flex-1 truncate rounded-lg px-1 py-1 text-center text-xs font-medium tabular-nums text-[var(--color-ink)] transition hover:bg-[var(--color-moss-soft)]/50"
+              title="Jump to this week"
+              onClick={() => setAnchor(new Date())}
+            >
+              {weekLabel(anchor)}
+            </button>
+            <button
+              type="button"
+              className="btn-ghost px-2 py-1 text-sm"
               aria-label="Next week"
               onClick={() => setAnchor((a) => addDays(a, 7))}
             >
               →
             </button>
           </div>
+          <button
+            type="button"
+            className="btn-primary mt-2 w-full text-center"
+            onClick={() => setAnchor(new Date())}
+          >
+            Today
+          </button>
+        </div>
 
-          <nav className="ml-auto flex gap-0.5 rounded-full border border-[var(--color-line)] bg-[var(--color-surface)]/70 p-0.5 text-sm">
-            {(
-              [
-                ['meals', 'Meals'],
-                ['fridge', 'Fridge'],
-                ['shopping', toBuy > 0 ? `Shopping · ${toBuy}` : 'Shopping'],
-                ['rules', 'Rules'],
-              ] as const
-            ).map(([id, label]) => (
+        <nav className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-auto px-2 py-3">
+          {NAV.map((item) => {
+            const active = drawer === item.id
+            const badge = item.id === 'shopping' && toBuy > 0 ? toBuy : null
+            return (
               <button
-                key={id}
+                key={item.id}
                 type="button"
-                onClick={() => setDrawer(drawer === id ? null : id)}
-                className={`rounded-full px-3 py-1.5 transition ${
-                  drawer === id
-                    ? 'bg-[var(--color-moss-soft)] text-[var(--color-moss)] shadow-sm'
-                    : 'text-[var(--color-ink)]/55 hover:bg-black/[0.04] hover:text-[var(--color-ink)]'
+                onClick={() => setDrawer(active ? null : item.id)}
+                className={`flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition ${
+                  active
+                    ? 'bg-[var(--color-moss-soft)] text-[var(--color-moss)] shadow-sm ring-1 ring-[var(--color-moss-edge)]/50'
+                    : 'text-[var(--color-ink)]/75 hover:bg-black/[0.035] hover:text-[var(--color-ink)]'
                 }`}
               >
-                {label}
+                <span
+                  className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border ${
+                    active
+                      ? 'border-[var(--color-moss-edge)] bg-white/50'
+                      : 'border-[var(--color-line)] bg-[var(--color-paper)]/70'
+                  }`}
+                >
+                  {item.icon}
+                </span>
+                <span className="min-w-0 flex-1 text-sm font-medium">{item.label}</span>
+                {badge != null && (
+                  <span className="rounded-md bg-[var(--color-rule-shopping)] px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-[var(--color-rule-shopping-ink)]">
+                    {badge}
+                  </span>
+                )}
               </button>
-            ))}
-          </nav>
-        </div>
-      </header>
+            )
+          })}
+        </nav>
 
-      <div className="min-h-0 flex-1">
-        <main className="mx-auto h-full min-h-0 max-w-[1600px] p-3 sm:p-4">
-          {planQuery.isLoading && <p className="p-4 text-sm opacity-60">Loading plan…</p>}
-          {planQuery.isError && (
-            <p className="p-4 text-sm text-[var(--color-warn)]">
-              Could not load plan. Is the API running on port 8000?
+        <div className="border-t border-[var(--color-line)]/80 px-3 py-3">
+          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-ink)]/40">
+            Legend
+          </p>
+          <ul className="space-y-1.5">
+            {LEGEND.map((item) => (
+              <li key={item.label} className="flex items-center gap-2 text-[11px] text-[var(--color-ink)]/65">
+                <span className={`h-2.5 w-2.5 rounded-sm border ${item.cls}`} />
+                {item.label}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </aside>
+
+      {/* Main calendar column */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="relative z-20 flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--color-line)]/80 bg-[var(--color-paper)]/75 px-4 py-3 backdrop-blur-md">
+          <div className="min-w-0">
+            <h1 className="font-[family-name:var(--font-display)] text-2xl leading-none tracking-tight">
+              Week plan
+            </h1>
+            <p className="mt-1 text-xs text-[var(--color-ink)]/50">
+              Drag empty time to add · click a block to edit · drag to reschedule
             </p>
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            {mutate.isPending && (
+              <span className="text-xs text-[var(--color-ink)]/45">Updating…</span>
+            )}
+            <button
+              type="button"
+              className="btn-ghost text-sm lg:hidden"
+              onClick={() => setSummaryOpen(true)}
+            >
+              Week summary
+            </button>
+            <button
+              type="button"
+              className="btn-ghost hidden text-sm lg:inline-flex"
+              onClick={() => setRailOpen((v) => !v)}
+              aria-pressed={railOpen}
+              title={railOpen ? 'Hide week summary' : 'Show week summary'}
+            >
+              {railOpen ? 'Hide summary' : 'Show summary'}
+            </button>
+          </div>
+        </header>
+
+        <main className="min-h-0 flex-1 p-3 sm:p-4">
+          {planQuery.isLoading && (
+            <div className="flex h-full items-center justify-center text-sm text-[var(--color-ink)]/50">
+              Loading plan…
+            </div>
+          )}
+          {planQuery.isError && (
+            <div className="flex h-full items-center justify-center p-4 text-sm text-[var(--color-warn)]">
+              Could not load plan. Is the API running on port 8000?
+            </div>
           )}
           {plan && (
             <WeekView
               weekAnchor={anchor}
               events={plan.events}
-              signals={plan.signals ?? []}
               draft={draft}
               onSelect={(ev) => {
                 setDraft(null)
@@ -221,26 +334,58 @@ export function CalendarPage() {
         </main>
       </div>
 
+      {/* Right productivity rail */}
+      {plan && railOpen && (
+        <div className="hidden w-[20rem] shrink-0 border-l border-[var(--color-line)]/90 lg:block">
+          <PlanPanel plan={plan} />
+        </div>
+      )}
+
       {toast && (
         <div
-          role="status"
-          className="fixed bottom-4 left-1/2 z-[60] flex max-w-md -translate-x-1/2 items-start gap-3 rounded-2xl border border-[var(--color-signal-edge)] bg-[var(--color-signal-soft)] px-4 py-3 text-sm text-[var(--color-signal)] shadow-lg"
+          className="signal-alert-backdrop fixed inset-0 z-[70] flex items-center justify-center bg-[var(--color-ink)]/45 p-4 backdrop-blur-[3px]"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="signal-alert-title"
+          aria-describedby="signal-alert-body"
+          onClick={dismissToast}
         >
-          <span
-            className="mt-1 inline-block h-2.5 w-2.5 shrink-0 rotate-45 bg-[var(--color-signal)]"
-            aria-hidden
-          />
-          <div className="min-w-0 flex-1">
-            <div className="font-medium">{toast.title}</div>
-            <div className="mt-0.5 opacity-80">{toast.body}</div>
-          </div>
-          <button
-            type="button"
-            className="shrink-0 rounded-md px-1.5 py-0.5 text-xs hover:bg-black/5"
-            onClick={dismissToast}
+          <div
+            className="signal-alert-card w-full max-w-md rounded-2xl border-2 border-[var(--color-signal-edge)] bg-[var(--color-signal-soft)] px-6 py-7 text-[var(--color-signal)] shadow-[0_28px_64px_-20px_rgba(44,50,46,0.45)]"
+            onClick={(e) => e.stopPropagation()}
           >
-            Dismiss
-          </button>
+            <div className="flex items-center gap-2.5">
+              <span
+                className="inline-block h-3.5 w-3.5 shrink-0 rotate-45 border-2 border-[var(--color-signal)] bg-[var(--color-signal)]"
+                aria-hidden
+              />
+              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--color-signal)]/70">
+                Prep now
+              </p>
+            </div>
+            <h2
+              id="signal-alert-title"
+              className="mt-3 font-[family-name:var(--font-display)] text-[2rem] leading-tight tracking-tight text-[var(--color-signal)]"
+            >
+              {toast.title}
+            </h2>
+            {toast.body && (
+              <p
+                id="signal-alert-body"
+                className="mt-2 text-base leading-relaxed text-[var(--color-signal)]/85"
+              >
+                {toast.body}
+              </p>
+            )}
+            <button
+              type="button"
+              className="mt-6 w-full rounded-xl border border-[var(--color-signal)] bg-[var(--color-signal)] px-4 py-3 text-sm font-semibold text-[var(--color-signal-soft)] transition hover:brightness-110"
+              onClick={dismissToast}
+              autoFocus
+            >
+              Got it
+            </button>
+          </div>
         </div>
       )}
 
@@ -268,14 +413,6 @@ export function CalendarPage() {
                 }
               : undefined
           }
-          onDuplicate={
-            selected
-              ? () => {
-                  mutate.mutate(() => api.duplicateEvent(selected.id))
-                  closeEditor()
-                }
-              : undefined
-          }
         />
       )}
 
@@ -289,6 +426,12 @@ export function CalendarPage() {
           {drawer === 'fridge' && <FridgePanel plan={plan} onPlan={setPlan} />}
           {drawer === 'shopping' && <ShoppingPanel plan={plan} />}
           {drawer === 'rules' && <RulesPanel plan={plan} onPlan={setPlan} />}
+        </SlideOver>
+      )}
+
+      {summaryOpen && plan && (
+        <SlideOver title="Week summary" onClose={() => setSummaryOpen(false)}>
+          <PlanPanel plan={plan} />
         </SlideOver>
       )}
 

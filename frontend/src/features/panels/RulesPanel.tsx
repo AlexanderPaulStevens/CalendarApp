@@ -28,11 +28,7 @@ const PARAM_LABELS: Record<string, string> = {
   activity_threshold_hours: 'Activity threshold (hours)',
   protein_target_g: 'Protein target (g)',
   carbohydrate_target_g: 'Carb target (g)',
-  shopping_batch_days: 'Days covered per trip (~2 trips/week at 3–4)',
-  shopping_lead_days: 'Lead days',
   shopping_duration_min: 'Trip duration (min)',
-  store_open_hour: 'Store opens',
-  store_close_hour: 'Store closes',
   weekend_goal_hours: 'Weekend study goal (hours)',
   weekend_earliest_hour: 'Weekend study earliest hour',
   weekend_latest_hour: 'Weekend study latest hour',
@@ -153,8 +149,8 @@ export function RulesPanel({ plan, onPlan }: Props) {
   return (
     <div className="min-h-0 flex-1 overflow-auto px-4 py-4">
       <p className="mb-4 text-sm opacity-70">
-        Closed catalog of Scheduling Rules. Toggle to place or clear Auto events;
-        edit parameters to change goals and placement constraints.
+        Turn rules on or off to reshape this week&apos;s Auto blocks. Edit
+        parameters to change goals, meal times, and placement constraints.
       </p>
 
       <ul className="space-y-3">
